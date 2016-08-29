@@ -2,17 +2,19 @@
 
 Train:
 ```
-vw --plt <number of labels> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c  --save_per_pass
+vw --plt <number of labels> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c --save_per_pass
 ```
 
 Test:
 ```
-vw -t -i <model file> <test data> -p <predictions file> --positive_labels --inner_threshold <inner threshold> --p_at <P@k>
+vw -t -i <model file> <test data> -p <predictions file> --positive_labels --inner_threshold <inner threshold> --p_at <k>
 ```
 
-`--positive_labels` - prints all labels with P > inner_threshold to predictions file (by default only one label is printed - multiclass output).
-`--inner_trashhold` - sets inner_threshold
-`--p_at` - evaluates classification accuracy according to P@k
+- `--positive_labels` - prints all labels with P > inner_threshold to predictions file (by default only one label is printed - multiclass output).
+- `--inner_trashhold` - sets inner_threshold
+- `--p_at` - evaluates classification accuracy according to P@k
+
+---
 
 ```
 /*
