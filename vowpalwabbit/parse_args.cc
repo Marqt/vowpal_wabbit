@@ -68,6 +68,7 @@ license as described in the file LICENSE.
 #include "vw_allreduce.h"
 #include "OjaNewton.h"
 #include "audit_regressor.h"
+#include "plt.h"
 
 using namespace std;
 //
@@ -1096,6 +1097,8 @@ void parse_reductions(vw& all)
   all.reduction_stack.push_back(bs_setup);
 
   all.reduction_stack.push_back(audit_regressor_setup);
+  
+  all.reduction_stack.push_back(plt_setup);
 
   all.l = setup_base(all);
 }
