@@ -14,12 +14,9 @@
 using namespace std;
 using namespace LEARNER;
 
+#define DEBUG false
+#define D_COUT if(DEBUG) cout
 
-#define E_LOG true
-#define LOG if(E_LOG) cout
-
-#define E_D_LOG false
-#define D_LOG if(E_D_LOG) cout
 
 typedef struct{
     uint32_t n;
@@ -42,44 +39,28 @@ struct plt {
     size_t ec_count;
 };
 
-// y = f(x) -> [0, 1]
-
-#define SIGMOID_TABLE_SIZE 512
-#define MAX_SIGMOID 50
-#define LOG_TABLE_SIZE 512
 
 inline float logistic(float in) { return 1.0f / (1.0f + exp(-in)); }
 
-void learn_node(plt& p, base_learner& base, example& ec, uint32_t n, bool positive) {
-
-    D_LOG << "\nLEARN NODE: N: " << n << " P?: " << positive << " ";
-
-    ec.l.simple = { positive ? 1.f : -1.f, 1.f, 0.f};
-    base.learn(ec, n);
-
-    D_LOG << " PP: " << ec.partial_prediction << " S: " << ec.pred.scalar << " P: " << ec.pred.prob;
-
+bool compare_label(const label &a, const label &b){
+    return a.p > b.p;
 }
 
 void learn(plt& p, base_learner& base, example& ec){
 
-    //D_LOG << "LEARN EXAMPLE: TAG: " << std::string(ec.tag.begin())  << " F: " << ec.num_features << " ";
+    D_COUT << "LEARN EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " F: " << ec.num_features << endl;
 
-    // multilabel - doesn't work?
-    //MULTILABEL::labels multilabels = ec.l.multilabels;
-
-    // multilabel with cost
-    COST_SENSITIVE::label ec_labels = ec.l.cs; //example labels
+    COST_SENSITIVE::label ec_labels = ec.l.cs;
 
     unordered_set<uint32_t> n_positive; // positive nodes
     unordered_set<uint32_t> n_negative; // negative nodes
 
     if (ec_labels.costs.size() > 0) {
-
         for (auto& cl : ec_labels.costs) {
-            D_LOG << "L: " << cl.class_index << ":" << cl.partial_prediction << " ";
-            // leaf index ( -2 because labels in {1..k})
-            uint32_t tn = cl.class_index + p.k - 2;
+            D_COUT << " L: " << cl.class_index;
+            if (cl.class_index > p.k)
+                cout << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
+            uint32_t tn = cl.class_index + p.k - 2; // leaf index ( -2 because labels in {1, k})
             n_positive.insert(tn);
             while(tn > 0) {
                 tn = floor((tn - 1)/2);
@@ -118,38 +99,52 @@ void learn(plt& p, base_learner& base, example& ec){
         }
     }
     else
-    {
         n_negative.insert(0);
+
+    D_COUT << endl;
+    ec.l.simple = {1.f, 1.f, 0.f};
+    for (auto &n : n_positive) {
+        base.learn(ec, n);
+
+        D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "LEARN NODE: " << n
+               << " PP: " << ec.partial_prediction
+               << " UP: " << ec.updated_prediction
+               << " L: " << ec.loss
+               << " S: " << ec.pred.scalar << endl;
     }
 
-    for(auto& n : n_positive)
-        learn_node(p, base, ec, n, true);
+    D_COUT << endl;
+    ec.l.simple.label = -1.f;
+    for (auto &n : n_negative) {
+        base.learn(ec, n);
 
-    for(auto& n : n_negative)
-        learn_node(p, base, ec, n, false);
+        D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "LEARN NODE: " << n
+               << " PP: " << ec.partial_prediction
+               << " UP: " << ec.updated_prediction
+               << " L: " << ec.loss
+               << " S: " << ec.pred.scalar << endl;
+    }
+    D_COUT << endl;
 
     ec.l.cs = ec_labels;
     ec.pred.multiclass = 0;
-
-    D_LOG << "\nLEARN END\n";
 }
 
-void predict_node(plt& p, base_learner& base, example& ec, uint32_t n) {
+void predict(plt& p, base_learner& base, example& ec){
 
-    D_LOG << "\nPREDICT NODE: N: " << n << " ";
-    ec.l.simple = {FLT_MAX, 0.f, 0.f};
-    base.predict(ec, n);
+    D_COUT << "PREDICT EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " F: " << ec.num_features << endl;
 
-    D_LOG << " PP: " << ec.partial_prediction << " S: " << ec.pred.scalar << " P: " << ec.pred.prob;
+    COST_SENSITIVE::label ec_labels = ec.l.cs;
 
-}
+    if (DEBUG) {
+        if (ec_labels.costs.size() > 0)
+            for (auto &cl : ec_labels.costs) D_COUT << " L: " << cl.class_index;
+        D_COUT << endl;
+    }
 
-void predict(plt& p,  base_learner& base, example& ec){
-
-    //D_LOG << "PREDICT EXAMPLE: TAG: " << std::string(ec.tag.begin())  << " ";
-
-    COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
-    float *ec_probs = calloc_or_throw<float>(p.k);
+    v_array<float> ec_probs;
+    ec_probs.resize(p.k);
+    for(int i = 0; i < p.k; ++i) ec_probs[i] = 0.f;
 
     queue<node> node_queue;
     vector<label> label_positive;
@@ -160,8 +155,15 @@ void predict(plt& p,  base_learner& base, example& ec){
         node node = node_queue.front(); // current node
         node_queue.pop();
 
-        predict_node(p, base, ec, node.n);
-        float cp = node.p * logistic(ec.pred.scalar);
+        ec.l.simple = {FLT_MAX, 0.f, 0.f};
+        base.predict(ec, node.n);
+
+        float cp = node.p * logistic(ec.partial_prediction);
+
+        D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "PREDICT NODE: " << node.n
+                << " NP: " << node.p
+                << " PP: " << logistic(ec.partial_prediction)
+                << " S: " << ec.pred.scalar << endl;
 
         if(cp > p.inner_threshold) {
 
@@ -174,40 +176,33 @@ void predict(plt& p,  base_learner& base, example& ec){
             else{
                 uint32_t l = node.n - p.k + 2;
 
-                D_LOG << "\nPOSITIVE LABEL: "<< l << ":" << cp;
+                D_COUT << " PL: " << l << ":" << cp;
 
                 label_positive.push_back({l, cp});
                 ec_probs[l - 1] = cp;
             }
         }
     }
+    D_COUT << endl;
 
-    if(p.positive_labels){
-        ec.pred.probs = ec_probs;
-    }
-
+    ec.pred.scalars = ec_probs;
     ec.l.cs = ec_labels;
-
-    D_LOG << "\nPREDINCT END\n";
-}
-
-bool compare_label(const label &a, const label &b){
-    return a.p > b.p;
 }
 
 void finish_example(vw& all, plt& p, example& ec){
 
-    ++p.ec_count;
+    D_COUT << "FINISH EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " F: " << ec.num_features << endl;
 
+    ++p.ec_count;
     vector<label> positive_labels;
 
     uint32_t pred = 0;
     for (uint32_t i = 0; i < p.k; ++i){
-        if (ec.pred.probs[i] > ec.pred.probs[pred])
+        if (ec.pred.scalars[i] > ec.pred.scalars[pred])
             pred = i;
 
-        if (ec.pred.probs[i] > p.inner_threshold)
-            positive_labels.push_back({i + 1, ec.pred.probs[i]});
+        if (ec.pred.scalars[i] > p.inner_threshold)
+            positive_labels.push_back({i + 1, ec.pred.scalars[i]});
     }
     ++pred; // prediction is {1..k} index (not 0)
 
@@ -242,27 +237,18 @@ void finish_example(vw& all, plt& p, example& ec){
         all.sd->update(ec.test_only, 0.0f, ec.l.multi.weight, ec.num_features);
     }
 
-    MULTICLASS::print_update_with_probability(all, ec, pred);
-    free(ec.pred.probs);
+    //MULTICLASS::print_update_with_probability(all, ec, pred);
     VW::finish_example(all, &ec);
 }
 
 void pass_end(plt& p){
-    LOG << "end of pass (epoch) " << p.all->passes_complete << "\n";
+    cout << "end of pass (epoch) " << p.all->passes_complete << "\n";
 }
 
 void finish(plt& p){
     if(p.p_at_K > 0)
-        LOG << "P@" << p.p_at_K << " = " << p.p_at_P / p.ec_count << "\n";
+        cout << "P@" << p.p_at_K << " = " << p.p_at_P / p.ec_count << "\n";
 }
-
-//void save_load(plt& p, io_buf& model_file, bool read, bool text){
-//    LOG << "additional save/load\n";
-//}
-//
-//void examples_end(plt& p){
-//    LOG << "end of all examples\n";
-//}
 
 base_learner* plt_setup(vw& all) //learner setup
 {
@@ -283,10 +269,10 @@ base_learner* plt_setup(vw& all) //learner setup
 
     data.p_at_P = 0;
     data.ec_count = 0;
-    data.p_at_K = 1;
+    data.p_at_K = 0;
 
     // plt parse options
-    // ----------------------------------------
+    // -----------------------------------------------------------------------------------------------------------------
 
     if (all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
@@ -298,47 +284,28 @@ base_learner* plt_setup(vw& all) //learner setup
         data.p_at_K = all.vm["p_at"].as<uint32_t>();
 
     // init learner
-    // ----------------------------------------
+    // -----------------------------------------------------------------------------------------------------------------
 
-    learner<plt> &l = init_learner(&data, setup_base(all), learn, predict, data.t);
+    learner<plt> &l = init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.k);
 
-    // multiclass learner and parser
-    //learner<plt> &l = init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.k);
+    // override parser
+    // -----------------------------------------------------------------------------------------------------------------
 
-
-    // override default values of some params
-    // ----------------------------------------
-    // override parser type with multilabel with cost parser
     all.p->lp = COST_SENSITIVE::cs_label;
     all.cost_sensitive = make_base(l);
 
-    // default learning rate to 10
-    if(!all.vm.count("learning_rate") && !all.vm.count("l"))
-        all.eta = 10;
-
-    // default initial_t to 1 instead of 0
-    if(!all.vm.count("initial_t")) {
-        all.sd->t = 1.f;
-        all.sd->weighted_unlabeled_examples = 1.f;
-        all.initial_t = 1.f;
-    }
-    all.eta *= powf((float)(all.sd->t), all.power_t);
-    all.holdout_set_off = true;
-
+    all.holdout_set_off = true; // turn off stop based on holdout loss
 
     // log info & add some event handlers
-    // ----------------------------------------
-    LOG << "plt\n" << "k = " << data.k << "\ntree size = " << data.t << endl;
+    // -----------------------------------------------------------------------------------------------------------------
+    cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t << endl;
+    cout << "inner_threshold = " << data.inner_threshold << "\n";
 
     if(!all.training) {
-        LOG << "inner_threshold = " << data.inner_threshold << "\n";
         l.set_finish_example(finish_example);
         l.set_finish(finish);
     }
-
     l.set_end_pass(pass_end);
 
     return all.cost_sensitive;
 }
-
-
