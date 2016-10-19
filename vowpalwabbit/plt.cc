@@ -17,7 +17,6 @@ using namespace LEARNER;
 #define DEBUG false
 #define D_COUT if(DEBUG) cout
 
-
 typedef struct{
     uint32_t n;
     float p;
@@ -30,8 +29,10 @@ typedef struct{
 
 struct plt {
     vw* all;
+
     uint32_t k; // number of labels
     uint32_t t; // number of tree nodes
+
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
     uint32_t p_at_K;
@@ -44,6 +45,16 @@ inline float logistic(float in) { return 1.0f / (1.0f + exp(-in)); }
 
 bool compare_label(const label &a, const label &b){
     return a.p > b.p;
+}
+
+inline void learn_node(uint32_t n, base_learner& base, example& ec){
+    base.learn(ec, n);
+
+    D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "LEARN NODE: " << n
+           << " PP: " << ec.partial_prediction
+           << " UP: " << ec.updated_prediction
+           << " L: " << ec.loss
+           << " S: " << ec.pred.scalar << endl;
 }
 
 void learn(plt& p, base_learner& base, example& ec){
@@ -68,6 +79,8 @@ void learn(plt& p, base_learner& base, example& ec){
             }
         }
 
+        D_COUT << endl;
+
         queue<uint32_t> n_queue; // nodes queue
         n_queue.push(0);
 
@@ -79,52 +92,24 @@ void learn(plt& p, base_learner& base, example& ec){
                 uint32_t n_left_child = 2 * n + 1; // node left child index
                 uint32_t n_right_child = 2 * n + 2; // node right child index
 
-                bool n_left_child_positive
-                        = n_positive.find(n_left_child) != n_positive.end();
-                bool n_right_child_positive
-                        = n_positive.find(n_right_child) != n_positive.end();
+                if (n_positive.find(n_left_child) != n_positive.end()) n_queue.push(n_left_child);
+                else n_negative.insert(n_left_child);
 
-                if (n_left_child_positive) {
-                    n_queue.push(n_left_child);
-                    if (!n_right_child_positive)
-                        n_negative.insert(n_right_child);
-                }
-
-                if (n_right_child_positive) {
-                    n_queue.push(n_right_child);
-                    if (!n_left_child_positive)
-                        n_negative.insert(n_left_child);
-                }
+                if (n_positive.find(n_right_child) != n_positive.end()) n_queue.push(n_right_child);
+                else n_negative.insert(n_right_child);
             }
         }
     }
     else
         n_negative.insert(0);
 
-    D_COUT << endl;
     ec.l.simple = {1.f, 1.f, 0.f};
-    for (auto &n : n_positive) {
-        base.learn(ec, n);
+    for (auto &n : n_positive) learn_node(n, base, ec);
 
-        D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "LEARN NODE: " << n
-               << " PP: " << ec.partial_prediction
-               << " UP: " << ec.updated_prediction
-               << " L: " << ec.loss
-               << " S: " << ec.pred.scalar << endl;
-    }
-
-    D_COUT << endl;
     ec.l.simple.label = -1.f;
-    for (auto &n : n_negative) {
-        base.learn(ec, n);
+    for (auto &n : n_negative) learn_node(n, base, ec);
 
-        D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "LEARN NODE: " << n
-               << " PP: " << ec.partial_prediction
-               << " UP: " << ec.updated_prediction
-               << " L: " << ec.loss
-               << " S: " << ec.pred.scalar << endl;
-    }
-    D_COUT << endl;
+    D_COUT << "----------------------------------------------------------------------------------------------------" << endl;
 
     ec.l.cs = ec_labels;
     ec.pred.multiclass = 0;
@@ -147,7 +132,6 @@ void predict(plt& p, base_learner& base, example& ec){
     for(int i = 0; i < p.k; ++i) ec_probs[i] = 0.f;
 
     queue<node> node_queue;
-    vector<label> label_positive;
 
     node_queue.push({0, 1.0f});
 
@@ -175,11 +159,9 @@ void predict(plt& p, base_learner& base, example& ec){
             }
             else{
                 uint32_t l = node.n - p.k + 2;
+                ec_probs[l - 1] = cp;
 
                 D_COUT << " PL: " << l << ":" << cp;
-
-                label_positive.push_back({l, cp});
-                ec_probs[l - 1] = cp;
             }
         }
     }
@@ -252,7 +234,7 @@ void finish(plt& p){
 
 base_learner* plt_setup(vw& all) //learner setup
 {
-    if (missing_option<size_t, true>(all, "plt", "Use probabilistic label tree for multiclass/label with <k> labels"))
+    if (missing_option<size_t, true>(all, "plt", "Use probabilistic label tree for multilabel with <k> labels"))
         return nullptr;
     new_options(all, "plt options")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
@@ -299,7 +281,7 @@ base_learner* plt_setup(vw& all) //learner setup
     // log info & add some event handlers
     // -----------------------------------------------------------------------------------------------------------------
     cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t << endl;
-    cout << "inner_threshold = " << data.inner_threshold << "\n";
+    cout << "inner_threshold = " << data.inner_threshold << endl;
 
     if(!all.training) {
         l.set_finish_example(finish_example);
