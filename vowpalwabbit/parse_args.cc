@@ -69,6 +69,7 @@ license as described in the file LICENSE.
 #include "OjaNewton.h"
 #include "audit_regressor.h"
 #include "plt.h"
+#include "plt_online.h"
 #include "marginal.h"
 #include "explore_eval.h"
 
@@ -1103,6 +1104,7 @@ void parse_reductions(vw& all)
   all.reduction_stack.push_back(audit_regressor_setup);
 
   all.reduction_stack.push_back(plt_setup);
+  all.reduction_stack.push_back(plt_online_setup);
 
   all.l = setup_base(all);
 }
