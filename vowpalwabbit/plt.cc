@@ -41,25 +41,52 @@ struct plt {
 };
 
 
-inline float logistic(float in) { return 1.0f / (1.0f + exp(-in)); }
+// debug helpers
+//----------------------------------------------------------------------------------------------------------------------
 
-bool compare_label(const label &a, const label &b){
+void plt_example_info(plt& p, base_learner& base, example& ec){
+    cout << "PREDICT EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-")
+         << " FEATURES COUNT: " << ec.num_features << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
+
+    cout << "BW: " << base.weights << " BI: " << base.increment
+         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
+
+    for (features &fs : ec) {
+        for (features::iterator_all &f : fs.values_indices_audit())
+            cout << "FEATURE: " << (f.index() & p.all->weights.mask()) << " VALUE: " << f.value() << endl;
+    }
+    for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
+}
+
+void plt_prediction_info(base_learner& base, example& ec){
+    cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
+         << " L: " << ec.loss << " S: " << ec.pred.scalar << endl;
+}
+
+
+// helpers
+//----------------------------------------------------------------------------------------------------------------------
+
+inline float logit(float in) { return 1.0f / (1.0f + exp(-in)); }
+
+bool plt_compare_label(const label &a, const label &b){
     return a.p > b.p;
 }
 
-inline void learn_node(uint32_t n, base_learner& base, example& ec){
-    base.learn(ec, n);
 
-    D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "LEARN NODE: " << n
-           << " PP: " << ec.partial_prediction
-           << " UP: " << ec.updated_prediction
-           << " L: " << ec.loss
-           << " S: " << ec.pred.scalar << endl;
+// learn
+//----------------------------------------------------------------------------------------------------------------------
+
+inline void learn_node(uint32_t n, base_learner& base, example& ec){
+    D_COUT << "LEARN NODE: " << n << endl;
+    base.learn(ec, n);
+    if(DEBUG) plt_prediction_info(base, ec);
 }
 
 void learn(plt& p, base_learner& base, example& ec){
 
-    D_COUT << "LEARN EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " F: " << ec.num_features << endl;
+    D_COUT << "LEARN EXAMPLE\n";
+    if(DEBUG) plt_example_info(p, base, ec);
 
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
@@ -68,18 +95,15 @@ void learn(plt& p, base_learner& base, example& ec){
 
     if (ec_labels.costs.size() > 0) {
         for (auto& cl : ec_labels.costs) {
-            D_COUT << " L: " << cl.class_index;
             if (cl.class_index > p.k)
                 cout << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
             uint32_t tn = cl.class_index + p.k - 2; // leaf index ( -2 because labels in {1, k})
             n_positive.insert(tn);
-            while(tn > 0) {
-                tn = floor((tn - 1)/2);
+            while (tn > 0) {
+                tn = floor((tn - 1) / 2);
                 n_positive.insert(tn);
             }
         }
-
-        D_COUT << endl;
 
         queue<uint32_t> n_queue; // nodes queue
         n_queue.push(0);
@@ -109,25 +133,29 @@ void learn(plt& p, base_learner& base, example& ec){
     ec.l.simple.label = -1.f;
     for (auto &n : n_negative) learn_node(n, base, ec);
 
-    D_COUT << "----------------------------------------------------------------------------------------------------" << endl;
-
     ec.l.cs = ec_labels;
     ec.pred.multiclass = 0;
+
+    D_COUT << "----------------------------------------------------------------------------------------------------\n";
+}
+
+// predict
+//----------------------------------------------------------------------------------------------------------------------
+
+inline void predict_node(uint32_t n, base_learner& base, example& ec){
+    D_COUT << "PREDICT NODE: " << n << endl;
+    base.predict(ec, n);
+    if(DEBUG) plt_prediction_info(base, ec);
 }
 
 void predict(plt& p, base_learner& base, example& ec){
 
-    D_COUT << "PREDICT EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " F: " << ec.num_features << endl;
+    D_COUT << "PREDICT EXAMPLE\n";
+    if(DEBUG) plt_example_info(p, base, ec);
 
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
-    if (DEBUG) {
-        if (ec_labels.costs.size() > 0)
-            for (auto &cl : ec_labels.costs) D_COUT << " L: " << cl.class_index;
-        D_COUT << endl;
-    }
-
-    v_array<float> ec_probs;
+    v_array<float> ec_probs = v_init<float>();
     ec_probs.resize(p.k);
     for(int i = 0; i < p.k; ++i) ec_probs[i] = 0.f;
 
@@ -140,17 +168,10 @@ void predict(plt& p, base_learner& base, example& ec){
         node_queue.pop();
 
         ec.l.simple = {FLT_MAX, 0.f, 0.f};
-        base.predict(ec, node.n);
-
-        float cp = node.p * logistic(ec.partial_prediction);
-
-        D_COUT << std::fixed << std::setw( 11 ) << std::setprecision( 6 ) << std::setfill( '0' ) << "PREDICT NODE: " << node.n
-                << " NP: " << node.p
-                << " PP: " << logistic(ec.partial_prediction)
-                << " S: " << ec.pred.scalar << endl;
+        predict_node(node.n, base, ec);
+        float cp = node.p * logit(ec.partial_prediction);
 
         if(cp > p.inner_threshold) {
-
             if (node.n < p.k - 1) {
                 uint32_t n_left_child = 2 * node.n + 1; // node left child index
                 uint32_t n_right_child = 2 * node.n + 2; // node right child index
@@ -161,19 +182,24 @@ void predict(plt& p, base_learner& base, example& ec){
                 uint32_t l = node.n - p.k + 2;
                 ec_probs[l - 1] = cp;
 
-                D_COUT << " PL: " << l << ":" << cp;
+                D_COUT << " POSITIVE LABEL: " << l << ":" << cp << endl;
             }
         }
     }
-    D_COUT << endl;
 
     ec.pred.scalars = ec_probs;
     ec.l.cs = ec_labels;
+
+    D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
+
+
+// other
+//----------------------------------------------------------------------------------------------------------------------
 
 void finish_example(vw& all, plt& p, example& ec){
 
-    D_COUT << "FINISH EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " F: " << ec.num_features << endl;
+    D_COUT << "FINISH EXAMPLE\n";
 
     ++p.ec_count;
     vector<label> positive_labels;
@@ -188,7 +214,7 @@ void finish_example(vw& all, plt& p, example& ec){
     }
     ++pred; // prediction is {1..k} index (not 0)
 
-    sort(positive_labels.begin(), positive_labels.end(), compare_label);
+    sort(positive_labels.begin(), positive_labels.end(), plt_compare_label);
 
     COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
 
@@ -232,6 +258,10 @@ void finish(plt& p){
         cout << "P@" << p.p_at_K << " = " << p.p_at_P / p.ec_count << "\n";
 }
 
+
+// setup
+//----------------------------------------------------------------------------------------------------------------------
+
 base_learner* plt_setup(vw& all) //learner setup
 {
     if (missing_option<size_t, true>(all, "plt", "Use probabilistic label tree for multilabel with <k> labels"))
@@ -254,9 +284,9 @@ base_learner* plt_setup(vw& all) //learner setup
     data.p_at_K = 0;
 
     // plt parse options
-    // -----------------------------------------------------------------------------------------------------------------
+    //------------------------------------------------------------------------------------------------------------------
 
-    if (all.vm.count("inner_threshold"))
+    if( all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
 
     if( all.vm.count("positive_labels"))
@@ -266,12 +296,12 @@ base_learner* plt_setup(vw& all) //learner setup
         data.p_at_K = all.vm["p_at"].as<uint32_t>();
 
     // init learner
-    // -----------------------------------------------------------------------------------------------------------------
+    //------------------------------------------------------------------------------------------------------------------
 
-    learner<plt> &l = init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.k);
+    learner<plt> &l = init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.t);
 
     // override parser
-    // -----------------------------------------------------------------------------------------------------------------
+    //------------------------------------------------------------------------------------------------------------------
 
     all.p->lp = COST_SENSITIVE::cs_label;
     all.cost_sensitive = make_base(l);
@@ -279,9 +309,9 @@ base_learner* plt_setup(vw& all) //learner setup
     all.holdout_set_off = true; // turn off stop based on holdout loss
 
     // log info & add some event handlers
-    // -----------------------------------------------------------------------------------------------------------------
-    cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t << endl;
-    cout << "inner_threshold = " << data.inner_threshold << endl;
+    //------------------------------------------------------------------------------------------------------------------
+    cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t
+         << "\ninner_threshold = " << data.inner_threshold << endl;
 
     if(!all.training) {
         l.set_finish_example(finish_example);
