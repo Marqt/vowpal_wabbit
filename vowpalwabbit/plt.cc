@@ -17,15 +17,19 @@ using namespace LEARNER;
 #define DEBUG false
 #define D_COUT if(DEBUG) cout
 
-typedef struct{
+struct node{
     uint32_t n;
     float p;
-} node;
 
-typedef struct{
+    bool operator < (const node& r) const { return p < r.p; }
+};
+
+struct label{
     uint32_t l;
     float p;
-} label;
+
+    bool operator < (const label& r) const { return p < r.p; }
+};
 
 struct plt {
     vw* all;
@@ -35,9 +39,14 @@ struct plt {
 
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
-    uint32_t p_at_K;
-    float p_at_P;
+    uint32_t p_at_k;
+    float precision;
+    float predicted_number;
+    vector<float> precision_at_k;
     size_t ec_count;
+
+    bool inference_threshold;
+    bool inference_top_k;
 };
 
 
@@ -68,10 +77,6 @@ void plt_prediction_info(base_learner& base, example& ec){
 //----------------------------------------------------------------------------------------------------------------------
 
 inline float logit(float in) { return 1.0f / (1.0f + exp(-in)); }
-
-bool plt_compare_label(const label &a, const label &b){
-    return a.p > b.p;
-}
 
 
 // learn
@@ -104,6 +109,8 @@ void learn(plt& p, base_learner& base, example& ec){
                 n_positive.insert(tn);
             }
         }
+
+        D_COUT << endl;
 
         queue<uint32_t> n_queue; // nodes queue
         n_queue.push(0);
@@ -156,36 +163,73 @@ void predict(plt& p, base_learner& base, example& ec){
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
     v_array<float> ec_probs = v_init<float>();
-    ec_probs.resize(p.k);
-    for(int i = 0; i < p.k; ++i) ec_probs[i] = 0.f;
 
-    queue<node> node_queue;
+    if (p.inference_threshold) {/// THRESHOLD PREDICTION
+        ec_probs.resize(p.k);
+        for (uint32_t i = 0; i < p.k; ++i) ec_probs[i] = 0.f;
 
-    node_queue.push({0, 1.0f});
+        queue <node> node_queue;
+        node_queue.push({0, 1.0f});
 
-    while(!node_queue.empty()) {
-        node node = node_queue.front(); // current node
-        node_queue.pop();
+        while(!node_queue.empty()) {
+            node node = node_queue.front(); // current node
+            node_queue.pop();
 
-        ec.l.simple = {FLT_MAX, 0.f, 0.f};
-        predict_node(node.n, base, ec);
-        float cp = node.p * logit(ec.partial_prediction);
+            ec.l.simple = {FLT_MAX, 0.f, 0.f};
+            predict_node(node.n, base, ec);
+            float cp = node.p * logit(ec.partial_prediction);
 
-        if(cp > p.inner_threshold) {
-            if (node.n < p.k - 1) {
-                uint32_t n_left_child = 2 * node.n + 1; // node left child index
-                uint32_t n_right_child = 2 * node.n + 2; // node right child index
-                node_queue.push({n_left_child, cp});
-                node_queue.push({n_right_child, cp});
-            }
-            else{
-                uint32_t l = node.n - p.k + 2;
-                ec_probs[l - 1] = cp;
-
-                D_COUT << " POSITIVE LABEL: " << l << ":" << cp << endl;
+            if(cp > p.inner_threshold){
+                if (node.n < p.k - 1) {
+                    uint32_t n_left_child = 2 * node.n + 1; // node left child index
+                    uint32_t n_right_child = 2 * node.n + 2; // node right child index
+                    node_queue.push({n_left_child, cp});
+                    node_queue.push({n_right_child, cp});
+                } else {
+                    uint32_t l = node.n - p.k + 2;
+                    ec_probs[l - 1] = cp;
+                }
             }
         }
-    }
+    }/// THRESHOLD PREDICTION
+    else {/// TOP-k PREDICTION
+        ec_probs.resize(2 * p.p_at_k);
+        for (uint32_t i = 0; i < 2 * p.p_at_k; ++i) ec_probs[i] = 0.f;
+
+        priority_queue <node> node_queue;
+        node_queue.push({0, 1.0f});
+        uint32_t found = 0;
+        vector <uint32_t> found_leaves = vector<uint32_t>();
+
+        while (!node_queue.empty()) {
+            node node = node_queue.top(); // current node
+            node_queue.pop();
+
+            if (find(found_leaves.begin(), found_leaves.end(), node.n) != found_leaves.end()) {
+                uint32_t l = node.n - p.k + 2;
+                ec_probs[2 * found] = (float)l;
+                ec_probs[2 * found + 1] = node.p;
+                ++found;
+                if (found >= p.p_at_k) break;
+
+            } else {
+                ec.l.simple = {FLT_MAX, 0.f, 0.f};
+                predict_node(node.n, base, ec);
+                float cp = node.p * logit(ec.partial_prediction);
+
+                if (node.n < p.k - 1) {
+                    uint32_t n_left_child = 2 * node.n + 1; // node left child index
+                    uint32_t n_right_child = 2 * node.n + 2; // node right child index
+                    node_queue.push({n_left_child, cp});
+                    node_queue.push({n_right_child, cp});
+                } else {
+                    found_leaves.push_back(node.n);
+                    node_queue.push({node.n, cp});
+                }
+            }
+        }
+    }/// TOP-k PREDICTION
+    D_COUT << endl;
 
     ec.pred.scalars = ec_probs;
     ec.l.cs = ec_labels;
@@ -202,32 +246,59 @@ void finish_example(vw& all, plt& p, example& ec){
     D_COUT << "FINISH EXAMPLE\n";
 
     ++p.ec_count;
-    vector<label> positive_labels;
 
-    uint32_t pred = 0;
-    for (uint32_t i = 0; i < p.k; ++i){
-        if (ec.pred.scalars[i] > ec.pred.scalars[pred])
-            pred = i;
+    vector <label> positive_labels;
 
-        if (ec.pred.scalars[i] > p.inner_threshold)
-            positive_labels.push_back({i + 1, ec.pred.scalars[i]});
-    }
-    ++pred; // prediction is {1..k} index (not 0)
+    if (p.inference_threshold) {/// THRESHOLD PREDICTION
 
-    sort(positive_labels.begin(), positive_labels.end(), plt_compare_label);
+        uint32_t pred = 0;
+        for (uint32_t i = 0; i < p.k; ++i) {
+            if (ec.pred.scalars[i] > ec.pred.scalars[pred])
+                pred = i;
 
-    COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
+            if (ec.pred.scalars[i] > p.inner_threshold)
+                positive_labels.push_back({i + 1, ec.pred.scalars[i]});
+        }
+        ++pred; // prediction is {1..k} index (not 0)
 
-    if(p.p_at_K > 0 && ec_labels.costs.size() > 0) {
-        for (size_t i = 0; i < p.p_at_K && i < positive_labels.size(); ++i) {
-            for (auto &cl : ec_labels.costs) {
-                if (positive_labels[i].l == cl.class_index) {
-                    p.p_at_P += 1.0f / p.p_at_K;
-                    break;
+        sort(positive_labels.rbegin(), positive_labels.rend());
+        COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
+
+        if (p.p_at_k > 0 && ec_labels.costs.size() > 0) {
+            p.predicted_number += (float)p.p_at_k;
+            for (size_t i = 0; i < p.p_at_k && i < positive_labels.size(); ++i) {
+                for (auto &cl : ec_labels.costs) {
+                    if (positive_labels[i].l == cl.class_index) {
+                        p.precision += 1.0f;
+                        break;
+                    }
                 }
             }
         }
-    }
+    }/// THRESHOLD PREDICTION
+    else {/// TOP-k PREDICTION
+        vector <uint32_t> true_labels;
+
+        for (uint32_t i = 0; i < p.p_at_k; ++i) {
+			positive_labels.push_back({uint32_t(ec.pred.scalars[2 * i]), ec.pred.scalars[2 * i + 1]});
+        }
+
+        COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
+        D_COUT << "Positive labels" << endl;
+        for (auto &cl : ec_labels.costs) {
+            D_COUT << cl.class_index << endl;
+            true_labels.push_back(cl.class_index);
+        }
+
+        if (p.p_at_k > 0 && ec_labels.costs.size() > 0) {
+            for (size_t i = 0; i < p.p_at_k; ++i) {
+                D_COUT << "top-" << i + 1 << " : " << positive_labels[i].l << " : " << positive_labels[i].p << endl;
+                if (std::find(true_labels.begin(), true_labels.end(), positive_labels[i].l) != true_labels.end()) {
+                    p.precision_at_k[i] += 1.0f;
+                }
+            }
+        }
+    }/// TOP-k PREDICTION
 
     if(p.positive_labels) {
         char temp_str[10];
@@ -254,8 +325,19 @@ void pass_end(plt& p){
 }
 
 void finish(plt& p){
-    if(p.p_at_K > 0)
-        cout << "P@" << p.p_at_K << " = " << p.p_at_P / p.ec_count << "\n";
+    if (p.inference_threshold) {/// THRESHOLD PREDICTION
+        if (p.predicted_number > 0) {
+            cout << "Precision = " << p.precision / p.predicted_number << "\n";
+        } else {
+            cout << "Precision unknown - nothing predicted" << endl;
+        }
+    } else {/// TOP-k PREDICTION
+        float correct = 0;
+        for (size_t i = 0; i < p.p_at_k; ++i) {
+            correct += p.precision_at_k[i];
+            cout << "P@" << i + 1 << " = " << correct / (p.ec_count * (i + 1)) << "\n";
+        }/// TOP-k PREDICTION
+    }
 }
 
 
@@ -275,13 +357,17 @@ base_learner* plt_setup(vw& all) //learner setup
     plt& data = calloc_or_throw<plt>();
     data.k = (uint32_t)all.vm["plt"].as<size_t>();
     data.t = 2 * data.k - 1;
-    data.inner_threshold = 0.15;
+    data.inner_threshold = -1;
     data.positive_labels = false;
     data.all = &all;
 
-    data.p_at_P = 0;
+    data.precision = 0;
+    data.predicted_number = 0;
     data.ec_count = 0;
-    data.p_at_K = 0;
+    data.p_at_k = 1;
+
+    data.inference_threshold = false;
+    data.inference_top_k = false;
 
     // plt parse options
     //------------------------------------------------------------------------------------------------------------------
@@ -293,7 +379,14 @@ base_learner* plt_setup(vw& all) //learner setup
         data.positive_labels = true;
 
     if( all.vm.count("p_at") )
-        data.p_at_K = all.vm["p_at"].as<uint32_t>();
+        data.p_at_k = all.vm["p_at"].as<uint32_t>();
+
+    if (data.inner_threshold >= 0) {
+        data.inference_threshold = true;
+    } else {
+        data.inference_top_k = true;
+        data.precision_at_k.resize(data.p_at_k);
+    }
 
     // init learner
     //------------------------------------------------------------------------------------------------------------------
