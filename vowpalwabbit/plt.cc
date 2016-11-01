@@ -24,13 +24,6 @@ struct node{
     bool operator < (const node& r) const { return p < r.p; }
 };
 
-struct label{
-    uint32_t l;
-    float p;
-
-    bool operator < (const label& r) const { return p < r.p; }
-};
-
 struct plt {
     vw* all;
 
@@ -43,7 +36,7 @@ struct plt {
     float precision;
     float predicted_number;
     vector<float> precision_at_k;
-    size_t ec_count;
+    size_t prediction_count;
 
     bool inference_threshold;
     bool inference_top_k;
@@ -54,8 +47,7 @@ struct plt {
 //----------------------------------------------------------------------------------------------------------------------
 
 void plt_example_info(plt& p, base_learner& base, example& ec){
-    cout << "PREDICT EXAMPLE: TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-")
-         << " FEATURES COUNT: " << ec.num_features << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
+    cout << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
 
     cout << "BW: " << base.weights << " BI: " << base.increment
          << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
@@ -149,10 +141,15 @@ void learn(plt& p, base_learner& base, example& ec){
 // predict
 //----------------------------------------------------------------------------------------------------------------------
 
-inline void predict_node(uint32_t n, base_learner& base, example& ec){
+inline float predict_node(uint32_t n, base_learner& base, example& ec){
     D_COUT << "PREDICT NODE: " << n << endl;
+
+    ec.l.simple = {FLT_MAX, 0.f, 0.f};
     base.predict(ec, n);
+
     if(DEBUG) plt_prediction_info(base, ec);
+
+    return logit(ec.partial_prediction);
 }
 
 void predict(plt& p, base_learner& base, example& ec){
@@ -160,24 +157,21 @@ void predict(plt& p, base_learner& base, example& ec){
     D_COUT << "PREDICT EXAMPLE\n";
     if(DEBUG) plt_example_info(p, base, ec);
 
+    ++p.prediction_count;
+
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
-    v_array<float> ec_probs = v_init<float>();
-
-    if (p.inference_threshold) {/// THRESHOLD PREDICTION
-        ec_probs.resize(p.k);
-        for (uint32_t i = 0; i < p.k; ++i) ec_probs[i] = 0.f;
-
-        queue <node> node_queue;
+    // threshold prediction
+    if (p.inner_threshold >= 0) {
+        vector<node> positive_labels;
+        queue<node> node_queue;
         node_queue.push({0, 1.0f});
 
         while(!node_queue.empty()) {
             node node = node_queue.front(); // current node
             node_queue.pop();
 
-            ec.l.simple = {FLT_MAX, 0.f, 0.f};
-            predict_node(node.n, base, ec);
-            float cp = node.p * logit(ec.partial_prediction);
+            float cp = node.p * predict_node(node.n, base, ec);
 
             if(cp > p.inner_threshold){
                 if (node.n < p.k - 1) {
@@ -187,19 +181,31 @@ void predict(plt& p, base_learner& base, example& ec){
                     node_queue.push({n_right_child, cp});
                 } else {
                     uint32_t l = node.n - p.k + 2;
-                    ec_probs[l - 1] = cp;
+                    positive_labels.push_back({l, cp});
                 }
             }
         }
-    }/// THRESHOLD PREDICTION
-    else {/// TOP-k PREDICTION
-        ec_probs.resize(2 * p.p_at_k);
-        for (uint32_t i = 0; i < 2 * p.p_at_k; ++i) ec_probs[i] = 0.f;
 
-        priority_queue <node> node_queue;
+        sort(positive_labels.rbegin(), positive_labels.rend());
+
+        if (p.p_at_k > 0 && ec_labels.costs.size() > 0) {
+            for (size_t i = 0; i < p.p_at_k && i < positive_labels.size(); ++i) {
+                p.predicted_number += 1.0f;
+                for (auto &cl : ec_labels.costs) {
+                    if (positive_labels[i].n == cl.class_index) {
+                        p.precision += 1.0f;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // top-k predictions
+    else {
+        vector<uint32_t> best_labels, found_leaves;
+        priority_queue<node> node_queue;
         node_queue.push({0, 1.0f});
-        uint32_t found = 0;
-        vector <uint32_t> found_leaves = vector<uint32_t>();
 
         while (!node_queue.empty()) {
             node node = node_queue.top(); // current node
@@ -207,15 +213,11 @@ void predict(plt& p, base_learner& base, example& ec){
 
             if (find(found_leaves.begin(), found_leaves.end(), node.n) != found_leaves.end()) {
                 uint32_t l = node.n - p.k + 2;
-                ec_probs[2 * found] = (float)l;
-                ec_probs[2 * found + 1] = node.p;
-                ++found;
-                if (found >= p.p_at_k) break;
+                best_labels.push_back(l);
+                if (best_labels.size() >= p.p_at_k) break;
 
             } else {
-                ec.l.simple = {FLT_MAX, 0.f, 0.f};
-                predict_node(node.n, base, ec);
-                float cp = node.p * logit(ec.partial_prediction);
+                float cp = node.p * predict_node(node.n, base, ec);
 
                 if (node.n < p.k - 1) {
                     uint32_t n_left_child = 2 * node.n + 1; // node left child index
@@ -228,10 +230,18 @@ void predict(plt& p, base_learner& base, example& ec){
                 }
             }
         }
-    }/// TOP-k PREDICTION
-    D_COUT << endl;
 
-    ec.pred.scalars = ec_probs;
+        vector<uint32_t> true_labels;
+        for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
+
+        if (p.p_at_k > 0 && true_labels.size() > 0) {
+            for (size_t i = 0; i < p.p_at_k; ++i) {
+                if (find(true_labels.begin(), true_labels.end(), best_labels[i]) != true_labels.end())
+                    p.precision_at_k[i] += 1.0f;
+            }
+        }
+    }
+
     ec.l.cs = ec_labels;
 
     D_COUT << "----------------------------------------------------------------------------------------------------\n";
@@ -245,61 +255,7 @@ void finish_example(vw& all, plt& p, example& ec){
 
     D_COUT << "FINISH EXAMPLE\n";
 
-    ++p.ec_count;
-
-    vector <label> positive_labels;
-
-    if (p.inference_threshold) {/// THRESHOLD PREDICTION
-
-        uint32_t pred = 0;
-        for (uint32_t i = 0; i < p.k; ++i) {
-            if (ec.pred.scalars[i] > ec.pred.scalars[pred])
-                pred = i;
-
-            if (ec.pred.scalars[i] > p.inner_threshold)
-                positive_labels.push_back({i + 1, ec.pred.scalars[i]});
-        }
-        ++pred; // prediction is {1..k} index (not 0)
-
-        sort(positive_labels.rbegin(), positive_labels.rend());
-        COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
-
-        if (p.p_at_k > 0 && ec_labels.costs.size() > 0) {
-            p.predicted_number += (float)p.p_at_k;
-            for (size_t i = 0; i < p.p_at_k && i < positive_labels.size(); ++i) {
-                for (auto &cl : ec_labels.costs) {
-                    if (positive_labels[i].l == cl.class_index) {
-                        p.precision += 1.0f;
-                        break;
-                    }
-                }
-            }
-        }
-    }/// THRESHOLD PREDICTION
-    else {/// TOP-k PREDICTION
-        vector <uint32_t> true_labels;
-
-        for (uint32_t i = 0; i < p.p_at_k; ++i) {
-			positive_labels.push_back({uint32_t(ec.pred.scalars[2 * i]), ec.pred.scalars[2 * i + 1]});
-        }
-
-        COST_SENSITIVE::label ec_labels = ec.l.cs; //example's labels
-        D_COUT << "Positive labels" << endl;
-        for (auto &cl : ec_labels.costs) {
-            D_COUT << cl.class_index << endl;
-            true_labels.push_back(cl.class_index);
-        }
-
-        if (p.p_at_k > 0 && ec_labels.costs.size() > 0) {
-            for (size_t i = 0; i < p.p_at_k; ++i) {
-                D_COUT << "top-" << i + 1 << " : " << positive_labels[i].l << " : " << positive_labels[i].p << endl;
-                if (std::find(true_labels.begin(), true_labels.end(), positive_labels[i].l) != true_labels.end()) {
-                    p.precision_at_k[i] += 1.0f;
-                }
-            }
-        }
-    }/// TOP-k PREDICTION
-
+    /* TODO: find a better way to do it
     if(p.positive_labels) {
         char temp_str[10];
         ostringstream output_stream;
@@ -315,17 +271,17 @@ void finish_example(vw& all, plt& p, example& ec){
 
         all.sd->update(ec.test_only, 0.0f, ec.l.multi.weight, ec.num_features);
     }
+    */
 
     //MULTICLASS::print_update_with_probability(all, ec, pred);
     VW::finish_example(all, &ec);
 }
-
 void pass_end(plt& p){
     cout << "end of pass (epoch) " << p.all->passes_complete << "\n";
 }
 
 void finish(plt& p){
-    if (p.inference_threshold) {/// THRESHOLD PREDICTION
+    if (p.inner_threshold >= 0) {/// THRESHOLD PREDICTION
         if (p.predicted_number > 0) {
             cout << "Precision = " << p.precision / p.predicted_number << "\n";
         } else {
@@ -335,7 +291,7 @@ void finish(plt& p){
         float correct = 0;
         for (size_t i = 0; i < p.p_at_k; ++i) {
             correct += p.precision_at_k[i];
-            cout << "P@" << i + 1 << " = " << correct / (p.ec_count * (i + 1)) << "\n";
+            cout << "P@" << i + 1 << " = " << correct / (p.prediction_count * (i + 1)) << "\n";
         }/// TOP-k PREDICTION
     }
 }
@@ -363,11 +319,9 @@ base_learner* plt_setup(vw& all) //learner setup
 
     data.precision = 0;
     data.predicted_number = 0;
-    data.ec_count = 0;
+    data.prediction_count = 0;
     data.p_at_k = 1;
 
-    data.inference_threshold = false;
-    data.inference_top_k = false;
 
     // plt parse options
     //------------------------------------------------------------------------------------------------------------------
@@ -381,12 +335,8 @@ base_learner* plt_setup(vw& all) //learner setup
     if( all.vm.count("p_at") )
         data.p_at_k = all.vm["p_at"].as<uint32_t>();
 
-    if (data.inner_threshold >= 0) {
-        data.inference_threshold = true;
-    } else {
-        data.inference_top_k = true;
+    if (data.inner_threshold < 0)
         data.precision_at_k.resize(data.p_at_k);
-    }
 
     // init learner
     //------------------------------------------------------------------------------------------------------------------
@@ -406,11 +356,9 @@ base_learner* plt_setup(vw& all) //learner setup
     cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t
          << "\ninner_threshold = " << data.inner_threshold << endl;
 
-    if(!all.training) {
-        l.set_finish_example(finish_example);
-        l.set_finish(finish);
-    }
+    l.set_finish_example(finish_example);
     l.set_end_pass(pass_end);
+    l.set_finish(finish);
 
     return all.cost_sensitive;
 }

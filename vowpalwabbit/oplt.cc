@@ -383,8 +383,8 @@ void predict(oplt& p, base_learner& base, example& ec){
 
     // threshold prediction
     if (p.inner_threshold >= 0) {
-        vector <node*> positive_labels;
-        queue <node*> n_queue;
+        vector<node*> positive_labels;
+        queue<node*> n_queue;
 
         p.tree_root->p = 1.0f;
         n_queue.push(p.tree_root);
@@ -425,8 +425,8 @@ void predict(oplt& p, base_learner& base, example& ec){
 
     // top-k predictions
     else{
-        vector <node*> best_labels, found_leaves;
-        priority_queue <node*, vector<node*>, compare_node_ptr_functor> n_queue;
+        vector<node*> best_labels, found_leaves;
+        priority_queue<node*, vector<node*>, compare_node_ptr_functor> n_queue;
 
         p.tree_root->p = 1.0f;
         n_queue.push(p.tree_root);
@@ -455,7 +455,7 @@ void predict(oplt& p, base_learner& base, example& ec){
             }
         }
 
-        vector <uint32_t> true_labels;
+        vector<uint32_t> true_labels;
         for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
 
         if (p.p_at_k > 0 && true_labels.size() > 0) {
@@ -478,6 +478,7 @@ void predict(oplt& p, base_learner& base, example& ec){
 void finish_example(vw& all, oplt& p, example& ec){
 
     D_COUT << "FINISH EXAMPLE\n";
+
     /* TODO: find a better way to do it
     if(p.positive_labels) {
         char temp_str[10];
