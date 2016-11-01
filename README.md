@@ -1,9 +1,16 @@
 ## PLT in VW
 
-Train:
+Train PLT:
 ```
-vw --plt <number of labels> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c --save_per_pass
+vw --plt <number of labels> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c --b <number of bits in the feature table>
 ```
+
+Train online PLT:
+```
+vw --oplt <num of bits for wv in ft> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c --b <num of bits in ft>
+```
+- `ws` - weights vectors = max number of nodes (predictors)
+- `ft` - feature space
 
 Test:
 ```
