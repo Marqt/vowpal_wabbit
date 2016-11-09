@@ -4,9 +4,11 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <algorithm>
 #include <vector>
 #include <queue>
+#include <list>
 
 #include "reductions.h"
 #include "vw.h"
@@ -32,18 +34,23 @@ struct plt {
 
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
+    vector<uint32_t> nodes_ec_count;
     uint32_t p_at_k;
     float precision;
     float predicted_number;
     vector<float> precision_at_k;
     size_t prediction_count;
+    float base_eta;
+    uint32_t decay_step;
+
+    void(*learn_node)(plt& p, uint32_t n, base_learner& base, example& ec);
 
     bool inference_threshold;
     bool inference_top_k;
 };
 
 
-// debug helpers
+// debug helpers - to delete
 //----------------------------------------------------------------------------------------------------------------------
 
 void plt_example_info(plt& p, base_learner& base, example& ec){
@@ -64,6 +71,14 @@ void plt_prediction_info(base_learner& base, example& ec){
          << " L: " << ec.loss << " S: " << ec.pred.scalar << endl;
 }
 
+void plt_print_all_weights(plt &p){
+    cout << endl << "W:";
+    for (uint64_t i = 0; i <= p.all->weights.mask() + 10; ++i) {
+        cout << " " << p.all->weights.first()[i];
+    }
+    cout << endl;
+}
+
 
 // helpers
 //----------------------------------------------------------------------------------------------------------------------
@@ -71,12 +86,42 @@ void plt_prediction_info(base_learner& base, example& ec){
 inline float logit(float in) { return 1.0f / (1.0f + exp(-in)); }
 
 
+// save/load
+//----------------------------------------------------------------------------------------------------------------------
+
+void save_load_nodes(plt& p, io_buf& model_file, bool read, bool text){
+
+    D_COUT << "SAVE/LOAD TREE\n";
+
+    if (model_file.files.size() > 0) {
+        bool resume = p.all->save_resume;
+        stringstream msg;
+        msg << ":" << resume << "\n";
+        bin_text_read_write_fixed(model_file, (char*) &resume, sizeof(resume), "", read, msg, text);
+
+        if(resume){
+            bin_text_read_write_fixed(model_file, (char *) &p.base_eta, sizeof(p.base_eta), "", read, msg, text);
+            bin_text_read_write_fixed(model_file, (char *) &p.decay_step, sizeof(p.decay_step), "", read, msg, text);
+            for(size_t i = 0; i < p.t; ++i)
+                bin_text_read_write_fixed(model_file, (char *) &p.nodes_ec_count[i], sizeof(p.nodes_ec_count[0]), "", read, msg, text);
+        }
+    }
+}
+
+
 // learn
 //----------------------------------------------------------------------------------------------------------------------
 
-inline void learn_node(uint32_t n, base_learner& base, example& ec){
+template<bool t_decay, bool exp_decay, bool step_decay>
+void learn_node(plt& p, uint32_t n, base_learner& base, example& ec){
     D_COUT << "LEARN NODE: " << n << endl;
+
+    if(t_decay) p.all->eta = p.base_eta / (1.0f + p.all->eta_decay_rate * p.nodes_ec_count[n]++);
+    if(exp_decay) p.all->eta = p.base_eta * exp(-p.all->eta_decay_rate * p.nodes_ec_count[n]++);
+    if(step_decay) p.all->eta = p.base_eta * pow(p.all->eta_decay_rate, floor(p.nodes_ec_count[n]++/p.decay_step));
+
     base.learn(ec, n);
+
     if(DEBUG) plt_prediction_info(base, ec);
 }
 
@@ -90,19 +135,23 @@ void learn(plt& p, base_learner& base, example& ec){
     unordered_set<uint32_t> n_positive; // positive nodes
     unordered_set<uint32_t> n_negative; // negative nodes
 
+    ec.l.simple = {1.f, 1.f, 0.f};
     if (ec_labels.costs.size() > 0) {
         for (auto& cl : ec_labels.costs) {
             if (cl.class_index > p.k)
                 cout << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
             uint32_t tn = cl.class_index + p.k - 2; // leaf index ( -2 because labels in {1, k})
+
             n_positive.insert(tn);
+            //learn_node(p, tn, base, ec);
+
+            //while (tn > 0 && n_positive.find(tn) != n_positive.end()) {
             while (tn > 0) {
                 tn = floor((tn - 1) / 2);
                 n_positive.insert(tn);
+                //learn_node(p, tn, base, ec);
             }
         }
-
-        D_COUT << endl;
 
         queue<uint32_t> n_queue; // nodes queue
         n_queue.push(0);
@@ -127,10 +176,10 @@ void learn(plt& p, base_learner& base, example& ec){
         n_negative.insert(0);
 
     ec.l.simple = {1.f, 1.f, 0.f};
-    for (auto &n : n_positive) learn_node(n, base, ec);
+    for (auto &n : n_positive) p.learn_node(p, n, base, ec);
 
     ec.l.simple.label = -1.f;
-    for (auto &n : n_negative) learn_node(n, base, ec);
+    for (auto &n : n_negative) p.learn_node(p, n, base, ec);
 
     ec.l.cs = ec_labels;
     ec.pred.multiclass = 0;
@@ -138,10 +187,11 @@ void learn(plt& p, base_learner& base, example& ec){
     D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
 
+
 // predict
 //----------------------------------------------------------------------------------------------------------------------
 
-inline float predict_node(uint32_t n, base_learner& base, example& ec){
+inline float predict_node(plt& p, uint32_t n, base_learner& base, example& ec){
     D_COUT << "PREDICT NODE: " << n << endl;
 
     ec.l.simple = {FLT_MAX, 0.f, 0.f};
@@ -152,6 +202,7 @@ inline float predict_node(uint32_t n, base_learner& base, example& ec){
     return logit(ec.partial_prediction);
 }
 
+template<bool use_threshold>
 void predict(plt& p, base_learner& base, example& ec){
 
     D_COUT << "PREDICT EXAMPLE\n";
@@ -162,7 +213,7 @@ void predict(plt& p, base_learner& base, example& ec){
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
     // threshold prediction
-    if (p.inner_threshold >= 0) {
+    if (use_threshold) {
         vector<node> positive_labels;
         queue<node> node_queue;
         node_queue.push({0, 1.0f});
@@ -171,7 +222,7 @@ void predict(plt& p, base_learner& base, example& ec){
             node node = node_queue.front(); // current node
             node_queue.pop();
 
-            float cp = node.p * predict_node(node.n, base, ec);
+            float cp = node.p * predict_node(p, node.n, base, ec);
 
             if(cp > p.inner_threshold){
                 if (node.n < p.k - 1) {
@@ -201,7 +252,7 @@ void predict(plt& p, base_learner& base, example& ec){
         }
     }
 
-    // top-k predictions
+        // top-k predictions
     else {
         vector<uint32_t> best_labels, found_leaves;
         priority_queue<node> node_queue;
@@ -217,7 +268,7 @@ void predict(plt& p, base_learner& base, example& ec){
                 if (best_labels.size() >= p.p_at_k) break;
 
             } else {
-                float cp = node.p * predict_node(node.n, base, ec);
+                float cp = node.p * predict_node(p, node.n, base, ec);
 
                 if (node.n < p.k - 1) {
                     uint32_t n_left_child = 2 * node.n + 1; // node left child index
@@ -274,26 +325,34 @@ void finish_example(vw& all, plt& p, example& ec){
     */
 
     //MULTICLASS::print_update_with_probability(all, ec, pred);
+
     VW::finish_example(all, &ec);
 }
+
 void pass_end(plt& p){
-    cout << "end of pass (epoch) " << p.all->passes_complete << "\n";
+    cout << "end of pass " << p.all->passes_complete << "\n";
 }
 
+template<bool use_threshold>
 void finish(plt& p){
-    if (p.inner_threshold >= 0) {/// THRESHOLD PREDICTION
+    // threshold prediction
+    if (use_threshold) {
         if (p.predicted_number > 0) {
             cout << "Precision = " << p.precision / p.predicted_number << "\n";
         } else {
             cout << "Precision unknown - nothing predicted" << endl;
         }
-    } else {/// TOP-k PREDICTION
+    }
+
+    // top-k predictions
+    else {
         float correct = 0;
         for (size_t i = 0; i < p.p_at_k; ++i) {
             correct += p.precision_at_k[i];
             cout << "P@" << i + 1 << " = " << correct / (p.prediction_count * (i + 1)) << "\n";
-        }/// TOP-k PREDICTION
+        }
     }
+
 }
 
 
@@ -305,17 +364,23 @@ base_learner* plt_setup(vw& all) //learner setup
     if (missing_option<size_t, true>(all, "plt", "Use probabilistic label tree for multilabel with <k> labels"))
         return nullptr;
     new_options(all, "plt options")
+            ("1t_decay", "eta = eta0 / (1 + decay * t)")
+            ("exp_decay", "eta = eta0 * exp(-decay * t)")
+            ("step_decay", po::value<uint32_t>(), "eta *= decay every step")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
-            ("positive_labels", "print all positive labels")
-            ("p_at", po::value<uint32_t>(), "P@k (default 1)");
+            ("p_at", po::value<uint32_t>(), "P@k (default 1)")
+            ("positive_labels", "print all positive labels");
     add_options(all);
 
     plt& data = calloc_or_throw<plt>();
     data.k = (uint32_t)all.vm["plt"].as<size_t>();
     data.t = 2 * data.k - 1;
+    data.nodes_ec_count.resize(data.t);
     data.inner_threshold = -1;
     data.positive_labels = false;
     data.all = &all;
+
+    data.base_eta = all.eta;
 
     data.precision = 0;
     data.predicted_number = 0;
@@ -326,6 +391,19 @@ base_learner* plt_setup(vw& all) //learner setup
     // plt parse options
     //------------------------------------------------------------------------------------------------------------------
 
+    learner<plt> *l;
+
+    if(all.vm.count("1t_decay"))
+        data.learn_node = learn_node<true, false, false>;
+    else if(all.vm.count("exp_decay"))
+        data.learn_node = learn_node<false, true, false>;
+    else if(all.vm.count("step_decay")) {
+        data.decay_step = all.vm["step_decay"].as<uint32_t>();
+        data.learn_node = learn_node<false, false, true>;
+    }
+    else
+        data.learn_node = learn_node<false, false, false>;
+
     if( all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
 
@@ -335,19 +413,22 @@ base_learner* plt_setup(vw& all) //learner setup
     if( all.vm.count("p_at") )
         data.p_at_k = all.vm["p_at"].as<uint32_t>();
 
-    if (data.inner_threshold < 0)
+    if (data.inner_threshold >= 0) { ;
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true>, all.p, data.t);
+        l->set_finish(finish<true>);
+    }
+    else{
         data.precision_at_k.resize(data.p_at_k);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false>, all.p, data.t);
+        l->set_finish(finish<false>);
+    }
 
-    // init learner
-    //------------------------------------------------------------------------------------------------------------------
-
-    learner<plt> &l = init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.t);
 
     // override parser
     //------------------------------------------------------------------------------------------------------------------
 
     all.p->lp = COST_SENSITIVE::cs_label;
-    all.cost_sensitive = make_base(l);
+    all.cost_sensitive = make_base(*l);
 
     all.holdout_set_off = true; // turn off stop based on holdout loss
 
@@ -356,9 +437,9 @@ base_learner* plt_setup(vw& all) //learner setup
     cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t
          << "\ninner_threshold = " << data.inner_threshold << endl;
 
-    l.set_finish_example(finish_example);
-    l.set_end_pass(pass_end);
-    l.set_finish(finish);
+    //l->set_finish_example(finish_example);
+    l->set_save_load(save_load_nodes);
+    l->set_end_pass(pass_end);
 
     return all.cost_sensitive;
 }
