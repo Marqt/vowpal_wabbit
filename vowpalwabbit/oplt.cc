@@ -348,8 +348,7 @@ void learn_node(oplt& p, node* n, base_learner& base, example& ec){
     if(t_decay) p.all->eta = p.base_eta / (1.0f + p.all->eta_decay_rate * n->ec_count++);
     if(exp_decay) p.all->eta = p.base_eta * exp(-p.all->eta_decay_rate * n->ec_count++);
     if(step_decay) p.all->eta = p.base_eta * pow(p.all->eta_decay_rate, floor(n->ec_count++/p.decay_step));
-
-    p.all->eta = p.base_eta / (1.0f + p.all->eta_decay_rate * n->ec_count++);
+    
     base.learn(ec, n->base_predictor);
 
     if(DEBUG) oplt_prediction_info(p, base, ec);
