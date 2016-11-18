@@ -27,9 +27,9 @@ struct node{
     uint32_t label;
 
     node* parent; // pointer to the parent node
-    node* temp;
     vector<node*> children; // pointers to the children nodes
     bool internal; // internal or leaf
+    bool inverted;
     uint32_t ec_count;
     float p; // prediction value
 
@@ -138,8 +138,8 @@ node* init_node(oplt& p) {
     n->children.reserve(0);
     p.tree.push_back(n);
     n->internal = false;
+    n->inverted = false;
     n->parent = nullptr;
-    n->temp = nullptr;
     n->ec_count = 0;
     
     return n;
@@ -193,7 +193,6 @@ void init_tree(oplt& p){
     p.base_predictors_count = 0;
     p.tree_leaves = unordered_map<uint32_t, node*>();
     p.tree_root = init_node(p); // root node
-    p.tree_root->temp = init_node(p); // first temp node
 }
 
 
@@ -226,7 +225,7 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
         msg << " tree_size = " << n_size;
 
         if(read){
-            for(size_t i = 0; i < n_size - 2; ++i) { // root and temp are already in tree after init
+            for(size_t i = 0; i < n_size - 1; ++i) { // root and temp are already in tree after init
                 node *n = new node();
                 p.tree.push_back(n);
             }
@@ -241,21 +240,19 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
         for(auto n : p.tree) {
             bin_text_read_write_fixed(model_file, (char *) &n->base_predictor, sizeof(n->base_predictor), "", read, msg, text);
             bin_text_read_write_fixed(model_file, (char *) &n->label, sizeof(n->label), "", read, msg, text);
+            bin_text_read_write_fixed(model_file, (char *) &n->inverted, sizeof(n->inverted), "", read, msg, text);
         }
 
         // read/write parent and rebuild tree
         for(auto n : p.tree) {
-            uint32_t parent_base_predictor, temp_base_predictor;
+            uint32_t parent_base_predictor;
 
             if(!read){
                 if(n->parent) parent_base_predictor = n->parent->base_predictor;
                 else parent_base_predictor = -1;
-                if(n->temp) temp_base_predictor = n->parent->base_predictor;
-                else temp_base_predictor = -1;
             }
 
             bin_text_read_write_fixed(model_file, (char*)&parent_base_predictor, sizeof(parent_base_predictor), "", read, msg, text);
-            bin_text_read_write_fixed(model_file, (char*)&temp_base_predictor, sizeof(temp_base_predictor), "", read, msg, text);
 
             if(read){
                 if(n->base_predictor == root_predictor) p.tree_root = n;
@@ -264,9 +261,7 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
                     if (m->base_predictor == parent_base_predictor) {
                         n->parent = m;
                         m->children.push_back(n);
-                    }
-                    if (m->base_predictor == temp_base_predictor) {
-                        m->temp = n;
+                        break;
                     }
                 }
             }
@@ -298,24 +293,23 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
 node* expand_node(oplt& p, node* n, uint32_t new_label){
     D_COUT << "EXPAND NODE: BASE: " << n->base_predictor << " LABEL: " << n->label << " NEW LABEL: " << new_label << endl;
 
-    node* copy_of_parent = init_node(p);
-    node* new_node = n->temp;
-    n->temp = nullptr;
+    node* parent_label_node = init_node(p);
+    node* new_label_node = init_node(p);
 
-    p.copy(p, n->base_predictor, copy_of_parent->base_predictor);
-    node_set_parent(p, copy_of_parent, n);
-    node_set_label(p, copy_of_parent, n->label);
-    copy_of_parent->temp = init_node(p);
+    p.copy(p, n->base_predictor, parent_label_node->base_predictor);
+    node_set_parent(p, parent_label_node, n);
+    node_set_label(p, parent_label_node, n->label);
+    parent_label_node->inverted = n->inverted;
 
-    node_set_parent(p, new_node, n);
-    node_set_label(p, new_node, new_label);
-    new_node->temp = init_node(p);
+    node_set_parent(p, new_label_node, n);
+    node_set_label(p, new_label_node, new_label);
+    new_label_node->inverted = !n->inverted;
 
     n->children.shrink_to_fit();
 
     if(DEBUG) oplt_tree_info(p);
 
-    return new_node;
+    return new_label_node;
 }
 
 node* new_label(oplt& p, base_learner& base, example& ec, uint32_t new_label){
@@ -348,7 +342,11 @@ void learn_node(oplt& p, node* n, base_learner& base, example& ec){
     if(exp_decay) p.all->eta = p.base_eta * exp(-p.all->eta_decay_rate * n->ec_count++);
     if(step_decay) p.all->eta = p.base_eta * pow(p.all->eta_decay_rate, floor(n->ec_count++/p.decay_step));
 
+    if(n->inverted) ec.l.simple.label *= -1.0f;
+
     base.learn(ec, n->base_predictor);
+
+    if(n->inverted) ec.l.simple.label *= -1.0f;
 
     if(DEBUG) oplt_prediction_info(p, base, ec);
 }
@@ -372,7 +370,6 @@ void learn(oplt& p, base_learner& base, example& ec){
         for (auto &cl : ec_labels.costs) {
             node *n = p.tree_leaves[cl.class_index];
             n_positive.insert(n);
-            n_negative.insert(n->temp);
             while (n->parent) {
                 n = n->parent;
                 n_positive.insert(n);
@@ -423,6 +420,8 @@ inline float predict_node(oplt &p, node *n, base_learner& base, example& ec){
     base.predict(ec, n->base_predictor);
 
     if(DEBUG) oplt_prediction_info(p, base, ec);
+
+    if(n->inverted) ec.partial_prediction *= -1.0f;
 
     return logit(ec.partial_prediction);
 }

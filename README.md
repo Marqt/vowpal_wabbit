@@ -1,26 +1,36 @@
 ## PLT in VW
 
-Train PLT:
+#### Train PLT:
 ```
 vw --plt <number of labels> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c --b <number of bits in the feature table>
 ```
 
-Train online PLT:
+#### Train online PLT:
 ```
 vw --oplt <num of bits for wv in ft> <train data> -f <model file> --sgd --loss_function logistic --passes <number of epochs> -c --b <num of bits in ft>
 ```
 - `ws` - weights vectors = max number of nodes (predictors)
 - `ft` - feature space
 
-Test:
+#### Test:
 ```
 vw -t -i <model file> <test data> -p <predictions file> --positive_labels --inner_threshold <inner threshold> --p_at <k>
 ```
 
-- `--positive_labels` - prints all labels with P > inner_threshold to predictions file (by default only one label is printed - multiclass output).
-- `--inner_trashhold` - sets inner_threshold
-- `--p_at` - evaluates classification accuracy according to P@k
+#### Options:
+```
+Useful:
+-l - learning rate (eta0)
+--decay_learning_rate (decay)
 
+PLT:
+--1t_decay - separate learning rate decay for each node with 1/t rule (eta = eta0 / (1 + decay * t))
+--exp_decay - separate learning rate decay for each node with exponential rule (eta = eta0 * exp(-decay * t))
+--step_decay <iterations in epoch> - separate epochs for each node
+--positive_labels` - prints all labels with P > inner_threshold to predictions file (by default only one label is printed - multiclass output).
+--inner_threshold <threshold> - sets inner_threshold
+--p_at <k> - evaluates classification accuracy according to P@k
+```
 ---
 
 ```
