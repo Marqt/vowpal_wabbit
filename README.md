@@ -24,6 +24,7 @@ Useful:
 --decay_learning_rate (decay)
 
 PLT:
+--kary_tree <k> - use complete k-ary tree instead of binary tree 
 --1t_decay - separate learning rate decay for each node with 1/t rule (eta = eta0 / (1 + decay * t))
 --exp_decay - separate learning rate decay for each node with exponential rule (eta = eta0 * exp(-decay * t))
 --step_decay <iterations in epoch> - separate epochs for each node
