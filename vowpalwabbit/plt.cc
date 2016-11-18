@@ -31,6 +31,8 @@ struct plt {
 
     uint32_t k; // number of labels
     uint32_t t; // number of tree nodes
+    uint32_t ti; // number of internal nodes
+    uint32_t kary;
 
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
@@ -48,7 +50,6 @@ struct plt {
     bool inference_threshold;
     bool inference_top_k;
 };
-
 
 // debug helpers - to delete
 //----------------------------------------------------------------------------------------------------------------------
@@ -122,6 +123,8 @@ void learn_node(plt& p, uint32_t n, base_learner& base, example& ec){
 
     base.learn(ec, n);
 
+    //cout << "NODE: " << n << " LABEL " << ec.l.simple.label << endl;
+
     if(DEBUG) plt_prediction_info(base, ec);
 }
 
@@ -140,14 +143,14 @@ void learn(plt& p, base_learner& base, example& ec){
         for (auto& cl : ec_labels.costs) {
             if (cl.class_index > p.k)
                 cout << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
-            uint32_t tn = cl.class_index + p.k - 2; // leaf index ( -2 because labels in {1, k})
+            uint32_t tn = cl.class_index + p.ti - 1; // leaf index ( -2 because labels in {1, k})
 
             n_positive.insert(tn);
             //learn_node(p, tn, base, ec);
 
             //while (tn > 0 && n_positive.find(tn) != n_positive.end()) {
             while (tn > 0) {
-                tn = floor((tn - 1) / 2);
+                tn = floor(static_cast<double>(tn - 1) / p.kary);
                 n_positive.insert(tn);
                 //learn_node(p, tn, base, ec);
             }
@@ -160,15 +163,13 @@ void learn(plt& p, base_learner& base, example& ec){
             uint32_t n = n_queue.front(); // current node index
             n_queue.pop();
 
-            if (n < p.k - 1) {
-                uint32_t n_left_child = 2 * n + 1; // node left child index
-                uint32_t n_right_child = 2 * n + 2; // node right child index
+            if (n < p.ti) {
+                for(uint32_t i = 1; i <= p.kary; ++i) {
+                    uint32_t n_child = p.kary * n + i;
 
-                if (n_positive.find(n_left_child) != n_positive.end()) n_queue.push(n_left_child);
-                else n_negative.insert(n_left_child);
-
-                if (n_positive.find(n_right_child) != n_positive.end()) n_queue.push(n_right_child);
-                else n_negative.insert(n_right_child);
+                    if (n_positive.find(n_child) != n_positive.end()) n_queue.push(n_child);
+                    else n_negative.insert(n_child);
+                }
             }
         }
     }
@@ -225,13 +226,13 @@ void predict(plt& p, base_learner& base, example& ec){
             float cp = node.p * predict_node(p, node.n, base, ec);
 
             if(cp > p.inner_threshold){
-                if (node.n < p.k - 1) {
-                    uint32_t n_left_child = 2 * node.n + 1; // node left child index
-                    uint32_t n_right_child = 2 * node.n + 2; // node right child index
-                    node_queue.push({n_left_child, cp});
-                    node_queue.push({n_right_child, cp});
+                if (node.n < p.ti) {
+                    for(uint32_t i = 1; i <= p.kary; ++i) {
+                        uint32_t n_child = p.kary * node.n + i;
+                        node_queue.push({n_child, cp});
+                    }
                 } else {
-                    uint32_t l = node.n - p.k + 2;
+                    uint32_t l = node.n - p.ti + 1;
                     positive_labels.push_back({l, cp});
                 }
             }
@@ -263,18 +264,18 @@ void predict(plt& p, base_learner& base, example& ec){
             node_queue.pop();
 
             if (find(found_leaves.begin(), found_leaves.end(), node.n) != found_leaves.end()) {
-                uint32_t l = node.n - p.k + 2;
+                uint32_t l = node.n - p.ti + 1;
                 best_labels.push_back(l);
                 if (best_labels.size() >= p.p_at_k) break;
 
             } else {
                 float cp = node.p * predict_node(p, node.n, base, ec);
 
-                if (node.n < p.k - 1) {
-                    uint32_t n_left_child = 2 * node.n + 1; // node left child index
-                    uint32_t n_right_child = 2 * node.n + 2; // node right child index
-                    node_queue.push({n_left_child, cp});
-                    node_queue.push({n_right_child, cp});
+                if (node.n < p.ti) {
+                    for(uint32_t i = 1; i <= p.kary; ++i) {
+                        uint32_t n_child = p.kary * node.n + i;
+                        node_queue.push({n_child, cp});
+                    }
                 } else {
                     found_leaves.push_back(node.n);
                     node_queue.push({node.n, cp});
@@ -364,6 +365,7 @@ base_learner* plt_setup(vw& all) //learner setup
     if (missing_option<size_t, true>(all, "plt", "Use probabilistic label tree for multilabel with <k> labels"))
         return nullptr;
     new_options(all, "plt options")
+            ("kary_tree", po::value<uint32_t>(), "tree in which each node has no more than k children")
             ("1t_decay", "eta = eta0 / (1 + decay * t)")
             ("exp_decay", "eta = eta0 * exp(-decay * t)")
             ("step_decay", po::value<uint32_t>(), "eta *= decay every step")
@@ -374,8 +376,6 @@ base_learner* plt_setup(vw& all) //learner setup
 
     plt& data = calloc_or_throw<plt>();
     data.k = (uint32_t)all.vm["plt"].as<size_t>();
-    data.t = 2 * data.k - 1;
-    data.nodes_ec_count.resize(data.t);
     data.inner_threshold = -1;
     data.positive_labels = false;
     data.all = &all;
@@ -392,6 +392,24 @@ base_learner* plt_setup(vw& all) //learner setup
     //------------------------------------------------------------------------------------------------------------------
 
     learner<plt> *l;
+
+    if(all.vm.count("kary_tree")) {
+        data.kary = all.vm["kary_tree"].as<uint32_t>();
+
+        double a = pow(data.kary, floor(log(data.k) / log(data.kary)));
+        double b = data.k - a;
+        double c = ceil(b / (data.kary - 1.0));
+        double d = (data.kary * a - 1.0)/(data.kary - 1.0);
+        double e = data.k - (a - c);
+        data.t = static_cast<uint32_t>(e + d);
+    }
+    else{
+        data.kary = 2;
+        data.t = 2 * data.k - 1;
+    }
+    data.ti = data.t - data.k;
+    data.nodes_ec_count.resize(data.t);
+    *(all.file_options) << " --kary_tree " << data.kary;
 
     if(all.vm.count("1t_decay"))
         data.learn_node = learn_node<true, false, false>;
@@ -413,7 +431,7 @@ base_learner* plt_setup(vw& all) //learner setup
     if( all.vm.count("p_at") )
         data.p_at_k = all.vm["p_at"].as<uint32_t>();
 
-    if (data.inner_threshold >= 0) { ;
+    if (data.inner_threshold >= 0) {
         l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true>, all.p, data.t);
         l->set_finish(finish<true>);
     }
