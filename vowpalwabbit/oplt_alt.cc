@@ -27,25 +27,30 @@ struct node{
     uint32_t label;
 
     node* parent; // pointer to the parent node
+    node* temp;
     vector<node*> children; // pointers to the children nodes
     bool internal; // internal or leaf
     bool inverted;
     uint32_t ec_count;
     float p; // prediction value
-
     bool operator < (const node& r) const { return p < r.p; }
 };
 
-struct oplt {
+struct oplt_alt {
     vw* all;
 
+    size_t k;
     size_t predictor_bits;
     size_t max_predictors;
     size_t base_predictors_count;
+    size_t kary;
 
     node *tree_root;
+    node *temp_tree_root;
     vector<node*> tree; // pointers to tree nodes
     unordered_map<uint32_t, node*> tree_leaves; // leaves map
+    size_t tree_depth;
+    size_t temp_tree_depth;
 
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
@@ -57,8 +62,9 @@ struct oplt {
     float base_eta;
     uint32_t decay_step;
 
-    void(*copy)(oplt& p, uint32_t wv1, uint32_t wv2);
-    void(*learn_node)(oplt& p, node* n, base_learner& base, example& ec);
+    void(*copy)(oplt_alt& p, uint32_t wv1, uint32_t wv2);
+    node*(*new_label)(oplt_alt& p, base_learner& base, example& ec, uint32_t new_label);
+    void(*learn_node)(oplt_alt& p, node* n, base_learner& base, example& ec);
 
     default_random_engine rng;
 };
@@ -67,12 +73,12 @@ struct oplt {
 // debug helpers - to delete
 //----------------------------------------------------------------------------------------------------------------------
 
-void oplt_example_info(oplt& p, base_learner& base, example& ec){
+void oplt_alt_example_info(oplt_alt& p, base_learner& base, example& ec){
     cout << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features
-         << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
+    << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
 
     cout << "BW: " << base.weights << " BI: " << base.increment
-         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
+    << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
 
     for (features &fs : ec) {
         for (features::iterator_all &f : fs.values_indices_audit())
@@ -81,12 +87,12 @@ void oplt_example_info(oplt& p, base_learner& base, example& ec){
     for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
 }
 
-void oplt_prediction_info(oplt& p, base_learner& base, example& ec){
+void oplt_alt_prediction_info(oplt_alt& p, base_learner& base, example& ec){
     cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
-         << " L: " << ec.loss << " S: " << ec.pred.scalar << " ETA: " << p.all->eta << endl;
+    << " L: " << ec.loss << " S: " << ec.pred.scalar << " ETA: " << p.all->eta << endl;
 }
 
-void oplt_print_all_weights(oplt &p){
+void oplt_alt_print_all_weights(oplt_alt &p){
     cout << endl << "WEIGHTS:";
     for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
         cout << " " << p.all->weights.first()[i];
@@ -95,7 +101,7 @@ void oplt_print_all_weights(oplt &p){
     cout << endl;
 }
 
-void oplt_tree_info(oplt& p){
+void oplt_alt_tree_info(oplt_alt& p){
     cout << "TREE SIZE: " << p.tree.size() << " TREE LEAVES: " << p.tree_leaves.size() << "\nTREE:\n";
     queue<node*> n_queue;
     n_queue.push(p.tree_root);
@@ -126,39 +132,50 @@ void oplt_tree_info(oplt& p){
 
 inline float logit(float in) { return 1.0f / (1.0f + exp(-in)); }
 
-bool compare_node_ptr_func(const node* l, const node* r) { return (*l < *r); }
+bool alt_compare_node_ptr_func(const node* l, const node* r) { return (*l < *r); }
 
-struct compare_node_ptr_functor{
+struct alt_compare_node_ptr_functor{
     bool operator()(const node* l, const node* r) const { return (*l < *r); }
 };
 
-node* init_node(oplt& p) {
+node* init_node(oplt_alt& p) {
     node* n = new node();
     n->base_predictor = p.base_predictors_count++;
     n->children.reserve(0);
-    p.tree.push_back(n);
-    n->internal = false;
+    //n->children.reserve(p.kary);
+    n->internal = true;
     n->inverted = false;
     n->parent = nullptr;
+    n->temp = nullptr;
     n->ec_count = 0;
-    
+    p.tree.push_back(n);
+
     return n;
 }
 
-void node_set_parent(oplt& p, node *n, node *parent){
+void node_set_parent(oplt_alt& p, node *n, node *parent){
     n->parent = parent;
     parent->children.push_back(n);
     parent->internal = true;
 }
 
-void node_set_label(oplt& p, node *n, uint32_t label){
+void node_set_label(oplt_alt& p, node *n, uint32_t label){
     n->internal = false;
     n->label = label;
     p.tree_leaves[label] = n;
 }
 
+node* node_copy(oplt_alt& p, node *n){
+    node* c = init_node(p);
+    p.copy(p, n->base_predictor, c->base_predictor);
+    c->ec_count = n->ec_count;
+    c->inverted = n->inverted;
+
+    return c;
+}
+
 template<bool stride>
-void copy_weights(oplt& p, uint32_t wv1, uint32_t wv2){
+void copy_weights(oplt_alt& p, uint32_t wv1, uint32_t wv2){
     weight_parameters &weights = p.all->weights;
     uint64_t mask = weights.mask();
 
@@ -189,17 +206,20 @@ void copy_weights(oplt& p, uint32_t wv1, uint32_t wv2){
 
 }
 
-void init_tree(oplt& p){
+void init_tree(oplt_alt& p){
     p.base_predictors_count = 0;
     p.tree_leaves = unordered_map<uint32_t, node*>();
     p.tree_root = init_node(p); // root node
+    p.temp_tree_root = p.tree_root;
+    p.tree_depth = 0;
+    p.temp_tree_depth = p.tree_depth;
 }
 
 
 // save/load
 //----------------------------------------------------------------------------------------------------------------------
 
-void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
+void save_load_tree(oplt_alt& p, io_buf& model_file, bool read, bool text){
 
     D_COUT << "SAVE/LOAD TREE\n";
 
@@ -216,7 +236,6 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
         // read/write number of predictors
         msg << " base_predictors_count = " << p.base_predictors_count;
         bin_text_read_write_fixed(model_file, (char*)&p.base_predictors_count, sizeof(p.base_predictors_count), "", read, msg, text);
-
 
         // read/write nodes
         size_t n_size;
@@ -241,18 +260,24 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
             bin_text_read_write_fixed(model_file, (char *) &n->base_predictor, sizeof(n->base_predictor), "", read, msg, text);
             bin_text_read_write_fixed(model_file, (char *) &n->label, sizeof(n->label), "", read, msg, text);
             bin_text_read_write_fixed(model_file, (char *) &n->inverted, sizeof(n->inverted), "", read, msg, text);
+            bin_text_read_write_fixed(model_file, (char *) &n->internal, sizeof(n->internal), "", read, msg, text);
         }
 
         // read/write parent and rebuild tree
         for(auto n : p.tree) {
-            uint32_t parent_base_predictor;
+            uint32_t parent_base_predictor, temp_base_predictor;
 
             if(!read){
                 if(n->parent) parent_base_predictor = n->parent->base_predictor;
                 else parent_base_predictor = -1;
+                if(n->temp) temp_base_predictor = n->temp->base_predictor;
+                else temp_base_predictor = -1;
             }
 
             bin_text_read_write_fixed(model_file, (char*)&parent_base_predictor, sizeof(parent_base_predictor), "", read, msg, text);
+            bin_text_read_write_fixed(model_file, (char*)&temp_base_predictor, sizeof(temp_base_predictor), "", read, msg, text);
+
+            D_COUT << "NODE: BASE: " << n->base_predictor << " PARENT: " << parent_base_predictor << " TEMP: " << temp_base_predictor << endl;
 
             if(read){
                 if(n->base_predictor == root_predictor) p.tree_root = n;
@@ -261,16 +286,19 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
                     if (m->base_predictor == parent_base_predictor) {
                         n->parent = m;
                         m->children.push_back(n);
-                        break;
+                    }
+                    else if (m->base_predictor == temp_base_predictor) {
+                        m->temp = n;
                     }
                 }
             }
         }
 
+        D_COUT << "TEST5\n";
+
         // recreate leafs index
         if(read) {
             for (auto n : p.tree) {
-                n->internal = n->children.size();
                 if (!n->internal) p.tree_leaves[n->label] = n;
             }
         }
@@ -278,11 +306,20 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
         if(resume){
             bin_text_read_write_fixed(model_file, (char *) &p.base_eta, sizeof(p.base_eta), "", read, msg, text);
             bin_text_read_write_fixed(model_file, (char *) &p.decay_step, sizeof(p.decay_step), "", read, msg, text);
-            for(auto n : p.tree)
+            bin_text_read_write_fixed(model_file, (char *) &p.tree_depth, sizeof(p.tree_depth), "", read, msg, text);
+            bin_text_read_write_fixed(model_file, (char *) &p.temp_tree_depth, sizeof(p.temp_tree_depth), "", read, msg, text);
+
+            uint32_t temp_root_predictor;
+            if(!read) temp_root_predictor = p.temp_tree_root->base_predictor;
+            bin_text_read_write_fixed(model_file, (char*)&temp_root_predictor, sizeof(temp_root_predictor), "", read, msg, text);
+
+            for(auto n : p.tree) {
+                if(read) if(n->base_predictor == temp_root_predictor) p.temp_tree_root = n;
                 bin_text_read_write_fixed(model_file, (char *) &n->ec_count, sizeof(n->ec_count), "", read, msg, text);
+            }
         }
 
-        if(DEBUG) oplt_tree_info(p);
+        if(DEBUG) oplt_alt_tree_info(p);
     }
 }
 
@@ -290,52 +327,8 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
 // learn
 //----------------------------------------------------------------------------------------------------------------------
 
-node* expand_node(oplt& p, node* n, uint32_t new_label){
-    D_COUT << "EXPAND NODE: BASE: " << n->base_predictor << " LABEL: " << n->label << " NEW LABEL: " << new_label << endl;
-
-    node* parent_label_node = init_node(p);
-    node* new_label_node = init_node(p);
-
-    p.copy(p, n->base_predictor, parent_label_node->base_predictor);
-    node_set_parent(p, parent_label_node, n);
-    node_set_label(p, parent_label_node, n->label);
-    parent_label_node->inverted = n->inverted;
-
-    node_set_parent(p, new_label_node, n);
-    node_set_label(p, new_label_node, new_label);
-    new_label_node->inverted = !n->inverted;
-
-    n->children.shrink_to_fit();
-
-    if(DEBUG) oplt_tree_info(p);
-
-    return new_label_node;
-}
-
-node* new_label(oplt& p, base_learner& base, example& ec, uint32_t new_label){
-    D_COUT << "NEW LABEL: " << new_label << endl;
-
-    // if first label
-    if(p.tree_leaves.size() == 0){
-        node_set_label(p, p.tree_root, new_label);
-        return p.tree_root;
-    }
-
-    node* to_expand = p.tree_root;
-    size_t children_count = to_expand->children.size();
-
-    // random policy
-    uniform_int_distribution<uint32_t> bin_dist(0, children_count - 1);
-    while(children_count){
-        to_expand = to_expand->children[bin_dist(p.rng)];
-        children_count = to_expand->children.size();
-    }
-
-    return expand_node(p, to_expand, new_label);
-}
-
 template<bool t_decay, bool exp_decay, bool step_decay>
-void learn_node(oplt& p, node* n, base_learner& base, example& ec){
+void learn_node(oplt_alt& p, node* n, base_learner& base, example& ec){
     D_COUT << "LEARN NODE: " << n->base_predictor << " LABEL: " << ec.l.simple.label << endl;
 
     if(t_decay) p.all->eta = p.base_eta / (1.0f + p.all->eta_decay_rate * n->ec_count++);
@@ -348,13 +341,106 @@ void learn_node(oplt& p, node* n, base_learner& base, example& ec){
 
     if(n->inverted) ec.l.simple.label *= -1.0f;
 
-    if(DEBUG) oplt_prediction_info(p, base, ec);
+    if(DEBUG) oplt_alt_prediction_info(p, base, ec);
 }
 
-void learn(oplt& p, base_learner& base, example& ec){
+inline float predict_node(oplt_alt &p, node *n, base_learner& base, example& ec){
+    D_COUT << "PREDICT NODE: " << n->base_predictor << endl;
+
+    ec.l.simple = {FLT_MAX, 0.f, 0.f};
+    base.predict(ec, n->base_predictor);
+
+    if(DEBUG) oplt_alt_prediction_info(p, base, ec);
+
+    if(n->inverted) ec.partial_prediction *= -1.0f;
+
+    return logit(ec.partial_prediction);
+}
+
+
+
+node* expand_node(oplt_alt& p, node* n, uint32_t new_label){
+    D_COUT << "EXPAND NODE: BASE: " << n->base_predictor << " NEW LABEL: " << new_label << endl;
+    D_COUT << "TREE: DEPTH: " << p.tree_depth << " TEMP_DEPTH: " << p.temp_tree_depth << endl;
+
+    if(p.tree.size() >= p.max_predictors){
+        cout << "Max number of nodes reached, tree can't be expanded.";
+        return n;
+    }
+
+    if(n->children.size() >= p.kary || !n->internal) {
+
+        if (p.tree_root == p.temp_tree_root) {
+            D_COUT << "EXPANDING ROOT\n";
+
+            node *parent_node = node_copy(p, n);
+            node_set_parent(p, n, parent_node);
+            p.tree_root = parent_node;
+
+            parent_node->temp = node_copy(p, n);
+            parent_node->temp->inverted = !parent_node->temp->inverted;
+
+            p.tree_root = parent_node;
+            p.temp_tree_root = parent_node;
+
+            ++p.tree_depth;
+            p.temp_tree_depth = p.tree_depth;
+
+            return expand_node(p, p.temp_tree_root, new_label);
+
+        } else {
+            D_COUT << "EXPANDING UP\n";
+
+            p.temp_tree_root = n->parent;
+            ++p.temp_tree_depth;
+            return expand_node(p, p.temp_tree_root, new_label);
+        }
+    }
+    else {
+        D_COUT << "EXPANDING DOWN\n";
+
+        node *new_node;
+
+        if (n->children.size() == p.kary - 1) {
+            new_node = n->temp;
+            n->temp = nullptr;
+        } else
+            new_node = node_copy(p, n->temp);
+
+        node_set_parent(p, new_node, n);
+
+        if(p.temp_tree_depth == 1) {
+            node_set_label(p, new_node, new_label);
+            return new_node;
+        } else {
+            new_node->temp = init_node(p);
+            new_node->internal = true;
+
+            p.temp_tree_root = new_node;
+            --p.temp_tree_depth;
+
+            return expand_node(p, new_node, new_label);
+        }
+    }
+}
+
+template<bool best_predicion>
+node* new_label(oplt_alt& p, base_learner& base, example& ec, uint32_t new_label){
+    D_COUT << "NEW LABEL: " << new_label << endl;
+
+    // if first label
+    if(p.tree_leaves.size() == 0){
+        node_set_label(p, p.tree_root, new_label);
+        return p.tree_root;
+    }
+
+    return expand_node(p, p.temp_tree_root, new_label);
+}
+
+void learn(oplt_alt& p, base_learner& base, example& ec){
 
     D_COUT << "LEARN EXAMPLE\n";
-    if(DEBUG) oplt_example_info(p, base, ec);
+    if(DEBUG) oplt_alt_example_info(p, base, ec);
 
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
@@ -364,12 +450,15 @@ void learn(oplt& p, base_learner& base, example& ec){
     if (ec_labels.costs.size() > 0) {
         for (auto &cl : ec_labels.costs) {
             if (p.tree_leaves.find(cl.class_index) == p.tree_leaves.end()){
-                new_label(p, base, ec, cl.class_index);
+                p.new_label(p, base, ec, cl.class_index);
+                if(DEBUG) oplt_alt_tree_info(p);
             }
         }
         for (auto &cl : ec_labels.costs) {
             node *n = p.tree_leaves[cl.class_index];
             n_positive.insert(n);
+            if(n->temp) n_negative.insert(n->temp);
+
             while (n->parent) {
                 n = n->parent;
                 n_positive.insert(n);
@@ -388,6 +477,7 @@ void learn(oplt& p, base_learner& base, example& ec){
                     if (n_positive.find(child) != n_positive.end()) n_queue.push(child);
                     else n_negative.insert(child);
                 }
+                if(n->temp) n_negative.insert(n->temp);
             }
         }
     }
@@ -401,7 +491,7 @@ void learn(oplt& p, base_learner& base, example& ec){
     ec.l.simple.label = -1.f;
     for (auto &n : n_negative) p.learn_node(p, n, base, ec);
 
-    if(DEBUG) oplt_print_all_weights(p);
+    if(DEBUG) oplt_alt_print_all_weights(p);
 
     ec.l.cs = ec_labels;
     ec.pred.multiclass = 0;
@@ -413,24 +503,11 @@ void learn(oplt& p, base_learner& base, example& ec){
 // predict
 //----------------------------------------------------------------------------------------------------------------------
 
-inline float predict_node(oplt &p, node *n, base_learner& base, example& ec){
-    D_COUT << "PREDICT NODE: " << n->base_predictor << endl;
-
-    ec.l.simple = {FLT_MAX, 0.f, 0.f};
-    base.predict(ec, n->base_predictor);
-
-    if(DEBUG) oplt_prediction_info(p, base, ec);
-
-    if(n->inverted) ec.partial_prediction *= -1.0f;
-
-    return logit(ec.partial_prediction);
-}
-
 template<bool use_threshold>
-void predict(oplt& p, base_learner& base, example& ec){
+void predict(oplt_alt& p, base_learner& base, example& ec){
 
     D_COUT << "PREDICT EXAMPLE\n";
-    if(DEBUG) oplt_example_info(p, base, ec);
+    if(DEBUG) oplt_alt_example_info(p, base, ec);
 
     ++p.prediction_count;
 
@@ -463,7 +540,7 @@ void predict(oplt& p, base_learner& base, example& ec){
             }
         }
 
-        sort(positive_labels.rbegin(), positive_labels.rend(), compare_node_ptr_func);
+        sort(positive_labels.rbegin(), positive_labels.rend(), alt_compare_node_ptr_func);
 
         if (p.p_at_k > 0 && ec_labels.costs.size() > 0) {
             for (size_t i = 0; i < p.p_at_k && i < positive_labels.size(); ++i) {
@@ -478,10 +555,10 @@ void predict(oplt& p, base_learner& base, example& ec){
         }
     }
 
-    // top-k predictions
+        // top-k predictions
     else{
         vector<node*> best_labels, found_leaves;
-        priority_queue<node*, vector<node*>, compare_node_ptr_functor> n_queue;
+        priority_queue<node*, vector<node*>, alt_compare_node_ptr_functor> n_queue;
 
         p.tree_root->p = 1.0f;
         n_queue.push(p.tree_root);
@@ -530,7 +607,7 @@ void predict(oplt& p, base_learner& base, example& ec){
 // other
 //----------------------------------------------------------------------------------------------------------------------
 
-void finish_example(vw& all, oplt& p, example& ec){
+void finish_example(vw& all, oplt_alt& p, example& ec){
 
     D_COUT << "FINISH EXAMPLE\n";
 
@@ -556,12 +633,12 @@ void finish_example(vw& all, oplt& p, example& ec){
     VW::finish_example(all, &ec);
 }
 
-void pass_end(oplt& p){
+void pass_end(oplt_alt& p){
     cout << "end of pass " << p.all->passes_complete << "\n";
 }
 
 template<bool use_threshold>
-void finish(oplt& p){
+void finish(oplt_alt& p){
     // threshold prediction
     if (use_threshold) {
         if (p.predicted_number > 0) {
@@ -587,22 +664,26 @@ void finish(oplt& p){
 // setup
 //----------------------------------------------------------------------------------------------------------------------
 
-base_learner* oplt_setup(vw& all) //learner setup
+base_learner* oplt_alt_setup(vw& all) //learner setup
 {
-    if (missing_option<size_t, true>(all, "oplt", "Use online probabilistic label tree for multilabel with <k> labels"))
+    if (missing_option<size_t, true>(all, "oplt_alt", "Use online probabilistic label tree for multilabel with max <k> labels"))
         return nullptr;
-    new_options(all, "oplt options")
+    new_options(all, "oplt_alt options")
+            ("kary_tree", po::value<uint32_t>(), "tree in which each node has no more than k children")
             ("1t_decay", "eta = eta0 / (1 + decay * t)")
             ("exp_decay", "eta = eta0 * exp(-decay * t)")
             ("step_decay", po::value<uint32_t>(), "eta *= decay every step")
+            ("random_policy", "expand random node")
+            ("best_prediction_policy", "expand node with best prediction value")
+            ("exp_decay", "eta = eta0 * exp(-decay * t)")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
             ("positive_labels", "print all positive labels");
     add_options(all);
 
-    oplt& data = calloc_or_throw<oplt>();
-    data.predictor_bits = all.vm["oplt"].as<size_t>();
-    data.max_predictors = (1 << data.predictor_bits) - 1;
+    oplt_alt& data = calloc_or_throw<oplt_alt>();
+    data.k = all.vm["oplt_alt"].as<size_t>();
+    data.kary = 2;
     data.inner_threshold = -1;
     data.positive_labels = false;
     data.all = &all;
@@ -618,21 +699,50 @@ base_learner* oplt_setup(vw& all) //learner setup
 
     init_tree(data);
 
-    // oplt parse options
+    // oplt_alt parse options
     // -----------------------------------------------------------------------------------------------------------------
 
-    learner<oplt> *l;
+    learner<oplt_alt> *l;
 
-    if(all.vm.count("1t_decay"))
+    string decay_type = "vw_decay";
+    string expand_policy = "random_policy";
+
+    // kary options
+    if(all.vm.count("kary_tree"))
+        data.kary = all.vm["kary_tree"].as<uint32_t>();
+    *(all.file_options) << " --kary_tree " << data.kary;
+
+    data.max_predictors = 1;
+    while(data.k > data.max_predictors)
+        data.max_predictors *= data.kary;
+    data.predictor_bits = static_cast<size_t>(floor(log2(data.max_predictors))) + 1;
+
+    // decay policy options
+    if(all.vm.count("1t_decay")) {
         data.learn_node = learn_node<true, false, false>;
-    else if(all.vm.count("exp_decay"))
+        decay_type = "1t_decay";
+    }
+    else if(all.vm.count("exp_decay")) {
         data.learn_node = learn_node<false, true, false>;
+        decay_type = "exp_decay";
+    }
     else if(all.vm.count("step_decay")) {
         data.decay_step = all.vm["step_decay"].as<uint32_t>();
         data.learn_node = learn_node<false, false, true>;
+        decay_type = "step_decay = " + to_string(data.decay_step);
     }
     else
         data.learn_node = learn_node<false, false, false>;
+
+    // expand policy options
+    if(all.vm.count("random_policy"))
+        data.new_label = new_label<false>;
+    else if(all.vm.count("best_prediction_policy")) {
+        data.new_label = new_label<true>;
+        expand_policy = "best_prediction_policy";
+    }
+    else
+        data.new_label = new_label<false>;
 
     if (all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
@@ -658,6 +768,7 @@ base_learner* oplt_setup(vw& all) //learner setup
     else
         data.copy = copy_weights<true>;
 
+
     // override parser
     // -----------------------------------------------------------------------------------------------------------------
 
@@ -666,10 +777,17 @@ base_learner* oplt_setup(vw& all) //learner setup
 
     all.holdout_set_off = true; // turn off stop based on holdout loss
 
+
     // log info & add some event handlers
     // -----------------------------------------------------------------------------------------------------------------
-    cout << "oplt\n" << "predictor_bits = " << data.predictor_bits << "\nmax_predictors = " << data.max_predictors
-         << "\ninner_threshold = " << data.inner_threshold << endl;
+    cout << "oplt_alt\n" << "predictor_bits = " << data.predictor_bits << "\nmax_predictors = " << data.max_predictors
+    << "\nkary_tree = " << data.kary << "\ninner_threshold = " << data.inner_threshold << endl;
+
+    if(decay_type.length())
+        cout << decay_type << endl;
+
+    if(decay_type.length())
+        cout << expand_policy << endl;
 
     // l.set_finish_example(finish_example);
     l->set_save_load(save_load_tree);

@@ -1106,6 +1106,7 @@ void parse_reductions(vw& all)
 
   all.reduction_stack.push_back(plt_setup);
   all.reduction_stack.push_back(oplt_setup);
+  all.reduction_stack.push_back(oplt_alt_setup);
 
   all.l = setup_base(all);
 }
