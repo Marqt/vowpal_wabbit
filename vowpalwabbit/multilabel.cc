@@ -188,4 +188,21 @@ void output_example(vw& all, example& ec)
 bool example_is_test(example& ec)
 { return is_test_label(ec.l.multilabels);
 }
+
+
+void print_multilabel_with_score(int f,  v_array<float>& pred)
+{ if (f >= 0)
+  { std::stringstream ss;
+    for (size_t i = 0; i < pred.size(); i+=2){
+      ss << pred[i]<<":"<<pred[i+1]<<" ";
+    }
+    ss << '\n';
+    ssize_t len = ss.str().size();
+    ssize_t t = io_buf::write_file_or_socket(f, ss.str().c_str(), (unsigned int)len);
+    if (t != len)
+      cerr << "write error: " << strerror(errno) << endl;
+  }
+}
+
+
 }

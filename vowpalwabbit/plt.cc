@@ -9,6 +9,7 @@
 #include <vector>
 #include <queue>
 #include <list>
+#include <sys/timeb.h>
 
 #include "reductions.h"
 #include "vw.h"
@@ -18,6 +19,7 @@ using namespace LEARNER;
 
 #define DEBUG false
 #define D_COUT if(DEBUG) cout
+
 
 struct node{
     uint32_t n;
@@ -36,6 +38,7 @@ struct plt {
 
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
+    bool top_k_labels;   // print top-k labels
     vector<uint32_t> nodes_ec_count;
     uint32_t p_at_k;
     float precision;
@@ -46,9 +49,10 @@ struct plt {
     uint32_t decay_step;
 
     void(*learn_node)(plt& p, uint32_t n, base_learner& base, example& ec);
-
-    bool inference_threshold;
-    bool inference_top_k;
+    
+    long n_visited_nodes;
+    v_array<float> predictions;
+    struct timeb t_start, t_end;
 };
 
 // debug helpers - to delete
@@ -256,9 +260,11 @@ void predict(plt& p, base_learner& base, example& ec){
         // top-k predictions
     else {
         vector<uint32_t> best_labels, found_leaves;
-        priority_queue<node> node_queue;
+	priority_queue<node> node_queue;
         node_queue.push({0, 1.0f});
-
+      
+	p.predictions.erase();
+	  
         while (!node_queue.empty()) {
             node node = node_queue.top(); // current node
             node_queue.pop();
@@ -266,11 +272,14 @@ void predict(plt& p, base_learner& base, example& ec){
             if (find(found_leaves.begin(), found_leaves.end(), node.n) != found_leaves.end()) {
                 uint32_t l = node.n - p.ti + 1;
                 best_labels.push_back(l);
+		p.predictions.push_back(float(l));
+	        p.predictions.push_back(float(node.p));
                 if (best_labels.size() >= p.p_at_k) break;
 
             } else {
                 float cp = node.p * predict_node(p, node.n, base, ec);
-
+		p.n_visited_nodes += 1;
+		
                 if (node.n < p.ti) {
                     for(uint32_t i = 1; i <= p.kary; ++i) {
                         uint32_t n_child = p.kary * node.n + i;
@@ -292,6 +301,10 @@ void predict(plt& p, base_learner& base, example& ec){
                     p.precision_at_k[i] += 1.0f;
             }
         }
+        
+	if(p.top_k_labels) {	  
+	  ec.pred.scalars = p.predictions;
+	} 
     }
 
     ec.l.cs = ec_labels;
@@ -299,34 +312,18 @@ void predict(plt& p, base_learner& base, example& ec){
     D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
 
-
 // other
 //----------------------------------------------------------------------------------------------------------------------
 
+
 void finish_example(vw& all, plt& p, example& ec){
 
-    D_COUT << "FINISH EXAMPLE\n";
-
-    /* TODO: find a better way to do it
-    if(p.positive_labels) {
-        char temp_str[10];
-        ostringstream output_stream;
-        for (size_t i = 0; i < positive_labels.size(); ++i) {
-            if (i > 0) output_stream << ' ';
-            output_stream << positive_labels[i].l;
-
-            sprintf(temp_str, "%f", positive_labels[i].p);
-            output_stream << ':' << temp_str;
-        }
-        for (int sink : all.final_prediction_sink)
-            all.print_text(sink, output_stream.str(), ec.tag);
-
-        all.sd->update(ec.test_only, 0.0f, ec.l.multi.weight, ec.num_features);
+    D_COUT << "FINISH EXAMPLE\n";	
+    if(p.top_k_labels) {
+      for (int sink : all.final_prediction_sink){
+	MULTILABEL::print_multilabel_with_score(sink, ec.pred.scalars);
+      }
     }
-    */
-
-    //MULTICLASS::print_update_with_probability(all, ec, pred);
-
     VW::finish_example(all, &ec);
 }
 
@@ -336,6 +333,10 @@ void pass_end(plt& p){
 
 template<bool use_threshold>
 void finish(plt& p){
+    //report time
+    ftime(&p.t_end);
+    int net_time = (int) (1000.0 * (p.t_end.time - p.t_start.time) + (p.t_end.millitm - p.t_start.millitm));
+    cout << "Computation time [ms]\t"<<net_time<<endl;
     // threshold prediction
     if (use_threshold) {
         if (p.predicted_number > 0) {
@@ -350,10 +351,10 @@ void finish(plt& p){
         float correct = 0;
         for (size_t i = 0; i < p.p_at_k; ++i) {
             correct += p.precision_at_k[i];
-            cout << "P@" << i + 1 << " = " << correct / (p.prediction_count * (i + 1)) << "\n";
+            cout << "P@" << i + 1 << "\t" << correct / (p.prediction_count * (i + 1)) << "\n";
         }
     }
-
+    cout << "#visited nodes\t" << p.n_visited_nodes << endl;
 }
 
 
@@ -371,13 +372,16 @@ base_learner* plt_setup(vw& all) //learner setup
             ("step_decay", po::value<uint32_t>(), "eta *= decay every step")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
-            ("positive_labels", "print all positive labels");
+            ("positive_labels", "print all positive labels")
+            ("top_k_labels", "print top-k labels");
+	    
     add_options(all);
 
     plt& data = calloc_or_throw<plt>();
     data.k = (uint32_t)all.vm["plt"].as<size_t>();
     data.inner_threshold = -1;
     data.positive_labels = false;
+    data.top_k_labels = false;
     data.all = &all;
 
     data.base_eta = all.eta;
@@ -386,7 +390,7 @@ base_learner* plt_setup(vw& all) //learner setup
     data.predicted_number = 0;
     data.prediction_count = 0;
     data.p_at_k = 1;
-
+    data.n_visited_nodes = 0;
 
     // plt parse options
     //------------------------------------------------------------------------------------------------------------------
@@ -428,6 +432,9 @@ base_learner* plt_setup(vw& all) //learner setup
     if( all.vm.count("positive_labels"))
         data.positive_labels = true;
 
+    if( all.vm.count("top_k_labels"))
+        data.top_k_labels = true;
+    
     if( all.vm.count("p_at") )
         data.p_at_k = all.vm["p_at"].as<uint32_t>();
 
@@ -441,7 +448,7 @@ base_learner* plt_setup(vw& all) //learner setup
         l->set_finish(finish<false>);
     }
 
-
+   
     // override parser
     //------------------------------------------------------------------------------------------------------------------
 
@@ -455,9 +462,11 @@ base_learner* plt_setup(vw& all) //learner setup
     cout << "plt\n" << "k = " << data.k << "\ntree size = " << data.t
          << "\ninner_threshold = " << data.inner_threshold << endl;
 
-    //l->set_finish_example(finish_example);
+    l->set_finish_example(finish_example);
     l->set_save_load(save_load_nodes);
     l->set_end_pass(pass_end);
 
+    ftime(&data.t_start);
+  
     return all.cost_sensitive;
 }

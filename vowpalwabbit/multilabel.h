@@ -22,4 +22,5 @@ bool example_is_test(example& ec);
 
 void print_update(vw& all, bool is_test, example& ec, const v_array<example*> *ec_seq);
 void print_multilabel(int f, labels& mls, v_array<char>& tag);
+void print_multilabel_with_score(int f,  v_array<float>& pred);
 }

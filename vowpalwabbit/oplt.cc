@@ -11,6 +11,7 @@
 #include <chrono>
 #include <random>
 #include <cstring>
+#include <sys/timeb.h>
 
 #include "reductions.h"
 #include "vw.h"
@@ -51,6 +52,7 @@ struct oplt {
 
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
+    bool top_k_labels;   // print top-k labels
     uint32_t p_at_k;
     float precision;
     float predicted_number;
@@ -64,6 +66,10 @@ struct oplt {
     void(*learn_node)(oplt& p, node* n, base_learner& base, example& ec);
 
     default_random_engine rng;
+    
+    long n_visited_nodes;
+    v_array<float> predictions;
+    struct timeb t_start, t_end;
 };
 
 
@@ -549,17 +555,22 @@ void predict(oplt& p, base_learner& base, example& ec){
         p.tree_root->p = 1.0f;
         n_queue.push(p.tree_root);
 
+	p.predictions.erase();
+	
         while (!n_queue.empty()) {
             node *n = n_queue.top(); // current node
             n_queue.pop();
 
             if (find(found_leaves.begin(), found_leaves.end(), n) != found_leaves.end()) {
                 best_labels.push_back(n);
+		p.predictions.push_back(float(n->label));
+	        p.predictions.push_back(float(n->p));
                 if (best_labels.size() >= p.p_at_k) break;
             }
             else {
                 float cp = n->p * predict_node(p, n, base, ec);
-
+		p.n_visited_nodes += 1;
+		
                 if (n->internal) {
                     for (auto child : n->children) {
                         child->p = cp;
@@ -582,6 +593,10 @@ void predict(oplt& p, base_learner& base, example& ec){
                     p.precision_at_k[i] += 1.0f;
             }
         }
+        
+        if(p.top_k_labels) {
+	  ec.pred.scalars = p.predictions;
+	} 
     }
 
     ec.l.cs = ec_labels;
@@ -596,25 +611,13 @@ void predict(oplt& p, base_learner& base, example& ec){
 void finish_example(vw& all, oplt& p, example& ec){
 
     D_COUT << "FINISH EXAMPLE\n";
-
-    /* TODO: find a better way to do it
-    if(p.positive_labels) {
-        char temp_str[10];
-        ostringstream output_stream;
-        for (size_t i = 0; i < positive_labels.size(); ++i) {
-            if (i > 0) output_stream << ' ';
-            output_stream << positive_labels[i].l;
-
-            sprintf(temp_str, "%f", positive_labels[i].p);
-            output_stream << ':' << temp_str;
-        }
-        for (int sink : all.final_prediction_sink)
-            all.print_text(sink, output_stream.str(), ec.tag);
-
-        all.sd->update(ec.test_only, 0.0f, ec.l.multi.weight, ec.num_features);
+    
+    if(p.top_k_labels) {
+      for (int sink : all.final_prediction_sink){
+	MULTILABEL::print_multilabel_with_score(sink, ec.pred.scalars);
+      }
     }
-    */
-
+    
     //MULTICLASS::print_update_with_probability(all, ec, pred);
     VW::finish_example(all, &ec);
 }
@@ -629,6 +632,11 @@ void pass_end(oplt& p){
 
 template<bool use_threshold>
 void finish(oplt& p){
+  
+    ftime(&p.t_end);
+    int net_time = (int) (1000.0 * (p.t_end.time - p.t_start.time) + (p.t_end.millitm - p.t_start.millitm));
+    cout << "Computation time [ms]\t"<<net_time<<endl;
+    
     // threshold prediction
     if (use_threshold) {
         if (p.predicted_number > 0) {
@@ -646,6 +654,7 @@ void finish(oplt& p){
             cout << "P@" << i + 1 << " = " << correct / (p.prediction_count * (i + 1)) << "\n";
         }
     }
+    cout << "#visited nodes\t" << p.n_visited_nodes << endl;
 
     for(auto n : p.tree) delete n;
     p.tree_leaves.~unordered_map();
@@ -668,7 +677,8 @@ base_learner* oplt_setup(vw& all) //learner setup
             ("exp_decay", "eta = eta0 * exp(-decay * t)")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
-            ("positive_labels", "print all positive labels");
+            ("positive_labels", "print all positive labels")
+            ("top_k_labels", "print top-k labels");
     add_options(all);
 
     oplt& data = calloc_or_throw<oplt>();
@@ -679,12 +689,14 @@ base_learner* oplt_setup(vw& all) //learner setup
     data.kary = 2;
     data.inner_threshold = -1;
     data.positive_labels = false;
+    data.top_k_labels = false;
     data.all = &all;
 
     data.precision = 0;
     data.predicted_number = 0;
     data.prediction_count = 0;
     data.p_at_k = 1;
+    data.n_visited_nodes = 0;
 
     data.base_eta = all.eta;
     data.rng.seed(all.random_seed);
@@ -754,6 +766,9 @@ base_learner* oplt_setup(vw& all) //learner setup
     if( all.vm.count("positive_labels"))
         data.positive_labels = true;
 
+    if( all.vm.count("top_k_labels"))
+        data.top_k_labels = true;
+    
     if (data.inner_threshold >= 0) { ;
         l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true>, all.p, data.max_predictors);
         l->set_finish(finish<true>);
@@ -793,9 +808,11 @@ base_learner* oplt_setup(vw& all) //learner setup
     if(expand_policy.length())
         cout << expand_policy << endl;
 
-    // l.set_finish_example(finish_example);
+    l->set_finish_example(finish_example);
     l->set_save_load(save_load_tree);
     l->set_end_pass(pass_end);
+    
+    ftime(&data.t_start);
 
     return all.cost_sensitive;
 }
