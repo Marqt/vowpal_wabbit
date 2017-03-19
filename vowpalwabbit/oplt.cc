@@ -77,8 +77,8 @@ struct oplt {
     struct timeb t_start, t_end;
 
     //dump/load tree structure
-    bool save_tree;
-    string save_tree_file;
+    bool save_tree_structure;
+    string save_tree_structure_file;
 };
 
 
@@ -105,10 +105,18 @@ void oplt_prediction_info(oplt& p, base_learner& base, example& ec){
 }
 
 void oplt_print_all_weights(oplt &p){
-    cout << endl << "WEIGHTS:";
+    cout << endl << "WEIGHTS:\n";
     for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
-        cout << " " << p.all->weights.first()[i];
-        if(!((i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift()))) cout << " | " << endl;
+        size_t j = (i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
+
+        bool show = false;
+        bool temp = false;
+        for(auto n : p.tree){
+            if(n->temp && n->temp->base_predictor == j) temp = true;
+            if(n->base_predictor == j) show = true;
+        }
+        if(show && !temp) cout << " " << abs(p.all->weights.first()[i]);
+        if(!j) cout << " | " << endl;
     }
     cout << endl;
 }
@@ -322,7 +330,7 @@ void save_load_tree(oplt& p, io_buf& model_file, bool read, bool text){
     }
 }
 
-vector<int> parse_line(string text, char d = ' '){
+vector<int> oplt_parse_line(string text, char d = ' '){
     vector<int> result;
     const char *str = text.c_str();
 
@@ -336,7 +344,7 @@ vector<int> parse_line(string text, char d = ' '){
 }
 
 // load tree structure
-void load_tree(oplt& p, string file_name){
+void load_tree_structure(oplt& p, string file_name){
     ifstream file;
     file.open(file_name);
     if(file.is_open()){
@@ -351,7 +359,7 @@ void load_tree(oplt& p, string file_name){
             vector<int> nodes;
 
             try {
-                nodes = parse_line(line);
+                nodes = oplt_parse_line(line);
             }
             catch(...){
                 cout << "Something is wrong with line " << line_count << " in " << file_name << "!\n";
@@ -388,7 +396,7 @@ void load_tree(oplt& p, string file_name){
 }
 
 // save tree structure
-void save_tree(oplt& p, string file_name){
+void save_tree_structure(oplt& p, string file_name){
     ofstream file;
     file.open(file_name);
     if(file.is_open()){
@@ -404,6 +412,7 @@ void save_tree(oplt& p, string file_name){
         cout << "Tree structure saved to " << file_name << endl;
     }
 }
+
 
 // learn
 //----------------------------------------------------------------------------------------------------------------------
@@ -459,7 +468,7 @@ node* expand_node(oplt& p, node* n, uint32_t new_label){
         node_set_parent(p, parent_label_node, n);
         node_set_label(p, parent_label_node, n->label);
 
-        parent_label_node->temp = init_node(p);
+        parent_label_node->temp = node_copy(p, n->temp);
     }
 
     node *new_label_node;
@@ -477,7 +486,7 @@ node* expand_node(oplt& p, node* n, uint32_t new_label){
     n->children.shrink_to_fit();
 
     D_COUT << "LABELS: " << p.tree_leaves.size() << " / " << p.k << endl;
-    D_COUT << "PREDICTORS: " << p.tree.size() << " / " << p.k << endl;
+    D_COUT << "PREDICTORS: " << p.tree.size() << " / " << p.max_predictors << endl;
     if(DEBUG) oplt_tree_info(p);
 
     return new_label_node;
@@ -531,7 +540,6 @@ void learn(oplt& p, base_learner& base, example& ec){
     unordered_set<node*> n_negative; // negative nodes
 
     if (ec_labels.costs.size() > 0) {
-
         if(p.all->numpasses == 1) {
             for (auto &cl : ec_labels.costs) {
                 if (p.tree_leaves.find(cl.class_index) == p.tree_leaves.end()) {
@@ -661,7 +669,7 @@ void predict(oplt& p, base_learner& base, example& ec){
         }
     }
 
-        // top-k predictions
+    // top-k predictions
     else{
         vector<node*> best_labels, found_leaves;
         priority_queue<node*, vector<node*>, compare_node_ptr_functor> n_queue;
@@ -751,7 +759,7 @@ void finish(oplt& p){
     int net_time = (int) (1000.0 * (p.t_end.time - p.t_start.time) + (p.t_end.millitm - p.t_start.millitm));
     cout << "Computation time [ms]\t"<<net_time<<endl;
 
-    if(p.save_tree) save_tree(p, p.save_tree_file);
+    if(p.save_tree_structure) save_tree_structure(p, p.save_tree_structure_file);
 
     // threshold prediction
     if (use_threshold) {
@@ -762,7 +770,7 @@ void finish(oplt& p){
         }
     }
 
-        // top-k predictions
+    // top-k predictions
     else {
         float correct = 0;
         for (size_t i = 0; i < p.p_at_k; ++i) {
@@ -795,8 +803,8 @@ base_learner* oplt_setup(vw& all) //learner setup
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
             ("positive_labels", "print all positive labels")
             ("top_k_labels", "print top-k labels")
-            ("save_tree", po::value<string>(), "save tree structure to file")
-            ("load_tree", po::value<string>(), "load tree structure from file");
+            ("save_tree_structure", po::value<string>(), "save tree structure to file")
+            ("load_tree_structure", po::value<string>(), "load tree structure from file");
     add_options(all);
 
     oplt& data = calloc_or_throw<oplt>();
@@ -886,15 +894,14 @@ base_learner* oplt_setup(vw& all) //learner setup
 
     init_tree(data);
 
-    if(all.vm.count("save_tree")) {
-        data.save_tree = true;
-        data.save_tree_file = all.vm["save_tree"].as<string>();
+    if(all.vm.count("save_tree_structure")) {
+        data.save_tree_structure = true;
+        data.save_tree_structure_file = all.vm["save_tree_structure"].as<string>();
     }
     else
-        data.save_tree = false;
-    if(all.vm.count("load_tree"))
-        load_tree(data, all.vm["load_tree"].as<string>());
-
+        data.save_tree_structure = false;
+    if(all.vm.count("load_tree_structure"))
+        load_tree_structure(data, all.vm["load_tree_structure"].as<string>());
 
     if(data.inner_threshold >= 0) { ;
         l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true>, all.p, data.max_predictors);
