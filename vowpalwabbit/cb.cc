@@ -15,14 +15,14 @@ using namespace std;
 
 namespace CB
 {
-  bool is_test_label(CB::label& ld)
-  { if (ld.costs.size() == 0)
-      return true;
-    for (size_t i=0; i<ld.costs.size(); i++)
-      if (FLT_MAX != ld.costs[i].cost && ld.costs[i].probability > 0.)
-	return false;
+bool is_test_label(CB::label& ld)
+{ if (ld.costs.size() == 0)
     return true;
-  }
+  for (size_t i=0; i<ld.costs.size(); i++)
+    if (FLT_MAX != ld.costs[i].cost && ld.costs[i].probability > 0.)
+      return false;
+  return true;
+}
 
 char* bufread_label(CB::label* ld, char* c, io_buf& cache)
 { size_t num = *(size_t *)c;
@@ -185,12 +185,15 @@ void print_update(vw& all, bool is_test, example& ec, v_array<example*>* ec_seq,
       label_buf = " known";
 
     if (action_scores)
-    { std::ostringstream pred_buf;
-      pred_buf << std::setw(all.sd->col_current_predict) << std::right << std::setfill(' ')
-               << ec.pred.a_s[0].action << ":" << ec.pred.a_s[0].score <<"...";
-      all.sd->print_update(all.holdout_set_off, all.current_pass, label_buf, pred_buf.str(),
-                           num_features, all.progress_add, all.progress_arg);;
-    }
+      { std::ostringstream pred_buf;
+	pred_buf << std::setw(all.sd->col_current_predict) << std::right << std::setfill(' ');
+	if (ec.pred.a_s.size() > 0)
+	  pred_buf << ec.pred.a_s[0].action << ":" << ec.pred.a_s[0].score <<"...";
+	else
+	  pred_buf << "no action";
+	all.sd->print_update(all.holdout_set_off, all.current_pass, label_buf, pred_buf.str(),
+			     num_features, all.progress_add, all.progress_arg);;
+      }
     else
       all.sd->print_update(all.holdout_set_off, all.current_pass, label_buf, (uint32_t)pred,
                            num_features, all.progress_add, all.progress_arg);

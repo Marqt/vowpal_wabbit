@@ -42,6 +42,8 @@ license as described in the file LICENSE.
  */
 ```
 
+<img src="/logo_assets/vowpal-wabbits-github-logo@3x.png" height="auto" width="100%" alt="Vowpal Wabbit">
+
 [![Build Status](https://travis-ci.org/JohnLangford/vowpal_wabbit.png)](https://travis-ci.org/JohnLangford/vowpal_wabbit)
 [![Windows Build Status](https://ci.appveyor.com/api/projects/status/github/JohnLangford/vowpal_wabbit?branch=master&svg=true)](https://ci.appveyor.com/project/JohnLangford/vowpal-wabbit)
 [![Coverage Status](https://coveralls.io/repos/JohnLangford/vowpal_wabbit/badge.svg)](https://coveralls.io/r/JohnLangford/vowpal_wabbit)
@@ -93,8 +95,11 @@ Note that `./autogen.sh` requires *automake* (see the prerequisites, above.)
 `./autogen.sh`'s command line arguments are passed directly to `configure` as
 if they were `configure` arguments and flags.
 
-Note that `./autogen.sh` will overwrite the supplied `Makefile`, so
-keeping a copy of `Makefile` may be a good idea before running `autogen.sh`.
+Note that `./autogen.sh` will overwrite the supplied `Makefile`, including the `Makefile`s in sub-directories, so
+keeping a copy of the `Makefile`s may be a good idea before running `autogen.sh`. If your original `Makefile`s were overwritten by `autogen.sh` calling `automake`, you may always get the originals back from git using:
+```
+git checkout Makefile */Makefile
+```
 
 Be sure to read the wiki: https://github.com/JohnLangford/vowpal_wabbit/wiki
 for the tutorial, command line options, etc.
@@ -170,8 +175,8 @@ brew install vowpal-wabbit
 ```
 [The homebrew formula for VW is located on github](https://github.com/Homebrew/homebrew-core/blob/master/Formula/vowpal-wabbit.rb).
 
-### Manual install ov Vowpal Wabbit
-#### OSX Dependencies (if using Brew): 
+### Manual install of Vowpal Wabbit
+#### OSX Dependencies (if using Brew):
 ```
 brew install libtool
 brew install autoconf
