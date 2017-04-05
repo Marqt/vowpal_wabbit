@@ -55,6 +55,7 @@ struct oplt {
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
     bool top_k_labels;   // print top-k labels
+    bool greedy;
     uint32_t p_at_k;
     float precision;
     float predicted_number;
@@ -86,64 +87,73 @@ struct oplt {
 //----------------------------------------------------------------------------------------------------------------------
 
 void oplt_example_info(oplt& p, base_learner& base, example& ec){
-    cout << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features
-         << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
-
-    cout << "BW: " << base.weights << " BI: " << base.increment
-         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
-
+//    cout << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features
+//         << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
+//
+//    cout << "BW: " << base.weights << " BI: " << base.increment
+//         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
+//
 //    for (features &fs : ec) {
 //        for (features::iterator_all &f : fs.values_indices_audit())
 //            cout << "FEATURE: " << (f.index() & p.all->weights.mask()) << " VALUE: " << f.value() << endl;
 //    }
-    for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
+//    for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
 }
 
 void oplt_prediction_info(oplt& p, base_learner& base, example& ec){
-    cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
-         << " L: " << ec.loss << " S: " << ec.pred.scalar << " ETA: " << p.all->eta << endl;
+//    cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
+//         << " L: " << ec.loss << " S: " << ec.pred.scalar << " ETA: " << p.all->eta << endl;
 }
 
-void oplt_print_all_weights(oplt &p){
-    cout << endl << "WEIGHTS:\n";
-    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
-        size_t j = (i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
-
-        bool show = false;
-        bool temp = false;
-        for(auto n : p.tree){
-            if(n->temp && n->temp->base_predictor == j) temp = true;
-            if(n->base_predictor == j) show = true;
-        }
-        if(show && !temp) cout << " " << abs(p.all->weights.first()[i]);
-        if(!j) cout << " | " << endl;
-    }
-    cout << endl;
+void oplt_print_all_weights(oplt &p, bool show_temp = false){
+//    cout << endl << "WEIGHTS:";
+//    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
+//        size_t j = i % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
+//
+//        bool show = false;
+//        bool temp = false;
+//        bool inverted = false;
+//        size_t base = 0;
+//        for(auto n : p.tree){
+//            if(n->temp && n->temp->base_predictor == j) temp = true;
+//            if(n->base_predictor == j){
+//                inverted = n->inverted;
+//                base = n->base_predictor;
+//                show = true;
+//            }
+//        }
+//
+//        j = (i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
+//
+//        if(show && (!temp || show_temp)) cout << "\t(" << base << ") " << (inverted ? -1 : 1) * p.all->weights.first()[i];
+//        if(!j) cout << " | " << endl;
+//    }
+//    cout << endl;
 }
 
 void oplt_tree_info(oplt& p){
-    cout << "TREE SIZE: " << p.tree.size() << " TREE LEAVES: " << p.tree_leaves.size() << "\nTREE:\n";
-    queue<node*> n_queue;
-    n_queue.push(p.tree_root);
-
-    size_t depth = 0;
-    while(!n_queue.empty()) {
-        size_t q_size = n_queue.size();
-        cout << "DEPTH " << depth << ": ";
-        for(size_t i = 0; i < q_size; ++i){
-            node *n = n_queue.front();
-            n_queue.pop();
-
-            if(n->parent) cout << "[" << n->parent->base_predictor << "]";
-            cout << n->base_predictor;
-            if(!n->internal) cout << "(" << n->label << ")";
-            cout << " ";
-
-            for(auto c : n->children) n_queue.push(c);
-        }
-        ++depth;
-        cout << endl;
-    }
+//    cout << "TREE SIZE: " << p.tree.size() << " TREE LEAVES: " << p.tree_leaves.size() << "\nTREE:\n";
+//    queue<node*> n_queue;
+//    n_queue.push(p.tree_root);
+//
+//    size_t depth = 0;
+//    while(!n_queue.empty()) {
+//        size_t q_size = n_queue.size();
+//        cout << "DEPTH " << depth << ": ";
+//        for(size_t i = 0; i < q_size; ++i){
+//            node *n = n_queue.front();
+//            n_queue.pop();
+//
+//            if(n->parent) cout << "[" << n->parent->base_predictor << "]";
+//            cout << n->base_predictor;
+//            if(!n->internal) cout << "(" << n->label << ")";
+//            cout << " ";
+//
+//            for(auto c : n->children) n_queue.push(c);
+//        }
+//        ++depth;
+//        cout << endl;
+//    }
 }
 
 
@@ -197,7 +207,7 @@ node* node_copy(oplt& p, node *n){
 
 template<bool stride>
 void copy_weights(oplt& p, uint32_t wv1, uint32_t wv2){
-    weight_parameters &weights = p.all->weights;
+    parameters &weights = p.all->weights;
     uint64_t mask = weights.mask();
 
     if(stride){
@@ -349,7 +359,7 @@ void load_tree_structure(oplt& p, string file_name){
     file.open(file_name);
     if(file.is_open()){
         string line;
-        uint32_t line_count;
+        uint32_t line_count = 0;
 
         while(getline(file, line)) {
             ++line_count;
@@ -618,7 +628,7 @@ void learn(oplt& p, base_learner& base, example& ec){
 // predict
 //----------------------------------------------------------------------------------------------------------------------
 
-template<bool use_threshold>
+template<bool use_threshold, bool greedy>
 void predict(oplt& p, base_learner& base, example& ec){
 
     D_COUT << "PREDICT EXAMPLE\n";
@@ -667,6 +677,30 @@ void predict(oplt& p, base_learner& base, example& ec){
                 }
             }
         }
+    }
+
+    else if (greedy) {
+        node* current = p.tree_root;
+        current->p = predict_node(p, current, base, ec);
+
+        while(current->internal){
+            node* best = current->children[0];
+
+            for (auto child : current->children) {
+                child->p = current->p * predict_node(p, child, base, ec);
+                p.n_visited_nodes += 1;
+
+                if(best->p < child->p) best = child;
+            }
+
+            current = best;
+        }
+
+        vector<uint32_t> true_labels;
+        for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
+
+        if (find(true_labels.begin(), true_labels.end(), current->label) != true_labels.end())
+            p.precision_at_k[0] += 1.0f;
     }
 
     // top-k predictions
@@ -798,13 +832,13 @@ base_learner* oplt_setup(vw& all) //learner setup
             ("step_decay", po::value<uint32_t>(), "eta *= decay every step")
             ("random_policy", "expand random node")
             ("best_prediction_policy", "expand node with best prediction value")
-            ("exp_decay", "eta = eta0 * exp(-decay * t)")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
             ("positive_labels", "print all positive labels")
             ("top_k_labels", "print top-k labels")
             ("save_tree_structure", po::value<string>(), "save tree structure to file")
-            ("load_tree_structure", po::value<string>(), "load tree structure from file");
+            ("load_tree_structure", po::value<string>(), "load tree structure from file")
+            ("greedy", "greedy prediction");
     add_options(all);
 
     oplt& data = calloc_or_throw<oplt>();
@@ -813,6 +847,7 @@ base_learner* oplt_setup(vw& all) //learner setup
     data.inner_threshold = -1;
     data.positive_labels = false;
     data.top_k_labels = false;
+    data.greedy = false;
     data.all = &all;
 
     data.precision = 0;
@@ -847,7 +882,7 @@ base_learner* oplt_setup(vw& all) //learner setup
         double c = ceil(b / (data.kary - 1.0));
         double d = (data.kary * a - 1.0)/(data.kary - 1.0);
         double e = data.k - (a - c);
-        cout << a << " " << b << " " << c << " " << d << " " << e << endl;
+        //cout << a << " " << b << " " << c << " " << d << " " << e << endl;
         //data.max_predictors = 2 * static_cast<uint32_t>(e + d); // for perfect k-ary tree
         data.max_predictors = static_cast<uint32_t>(3 * d + 2 * e);
     }
@@ -883,14 +918,50 @@ base_learner* oplt_setup(vw& all) //learner setup
     else //if(all.vm.count("random_policy"))
         data.new_label = new_label<false>;
 
+
     if(all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
+
     if(all.vm.count("p_at") )
         data.p_at_k = all.vm["p_at"].as<uint32_t>();
+
     if(all.vm.count("positive_labels"))
         data.positive_labels = true;
+
     if(all.vm.count("top_k_labels"))
         data.top_k_labels = true;
+
+    if( all.vm.count("greedy"))
+        data.greedy = true;
+
+    if(all.weights.stride_shift())
+        data.copy = copy_weights<false>;
+    else
+        data.copy = copy_weights<true>;
+
+
+    // init multiclass learner
+    // -----------------------------------------------------------------------------------------------------------------
+
+    if (data.inner_threshold >= 0) {
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true, false>, all.p, data.max_predictors);
+        l->set_finish(finish<true>);
+    }
+    else if(data.greedy){
+        data.p_at_k = 1;
+        data.precision_at_k.resize(data.p_at_k);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, true>, all.p, data.max_predictors);
+        l->set_finish(finish<false>);
+    }
+    else{
+        data.precision_at_k.resize(data.p_at_k);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false>, all.p, data.max_predictors);
+        l->set_finish(finish<false>);
+    }
+
+
+    // init tree
+    // -----------------------------------------------------------------------------------------------------------------
 
     init_tree(data);
 
@@ -903,20 +974,6 @@ base_learner* oplt_setup(vw& all) //learner setup
     if(all.vm.count("load_tree_structure"))
         load_tree_structure(data, all.vm["load_tree_structure"].as<string>());
 
-    if(data.inner_threshold >= 0) { ;
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true>, all.p, data.max_predictors);
-        l->set_finish(finish<true>);
-    }
-    else {
-        data.precision_at_k.resize(data.p_at_k);
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false>, all.p, data.max_predictors);
-        l->set_finish(finish<false>);
-    }
-
-    if(all.weights.stride_shift())
-        data.copy = copy_weights<false>;
-    else
-        data.copy = copy_weights<true>;
 
     // override parser
     // -----------------------------------------------------------------------------------------------------------------

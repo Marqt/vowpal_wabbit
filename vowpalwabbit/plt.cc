@@ -39,6 +39,7 @@ struct plt {
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
     bool top_k_labels;   // print top-k labels
+    bool greedy;
     vector<uint32_t> nodes_ec_count;
     uint32_t p_at_k;
     float precision;
@@ -59,29 +60,29 @@ struct plt {
 //----------------------------------------------------------------------------------------------------------------------
 
 void plt_example_info(plt& p, base_learner& base, example& ec){
-    cout << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
-
-    cout << "BW: " << base.weights << " BI: " << base.increment
-         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
-
-    for (features &fs : ec) {
-        for (features::iterator_all &f : fs.values_indices_audit())
-            cout << "FEATURE: " << (f.index() & p.all->weights.mask()) << " VALUE: " << f.value() << endl;
-    }
-    for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
+//    cout << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
+//
+//    cout << "BW: " << base.weights << " BI: " << base.increment
+//         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
+//
+//    for (features &fs : ec) {
+//        for (features::iterator_all &f : fs.values_indices_audit())
+//            cout << "FEATURE: " << (f.index() & p.all->weights.mask()) << " VALUE: " << f.value() << endl;
+//    }
+//    for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
 }
 
 void plt_prediction_info(base_learner& base, example& ec){
-    cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
-         << " L: " << ec.loss << " S: " << ec.pred.scalar << endl;
+//    cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
+//         << " L: " << ec.loss << " S: " << ec.pred.scalar << endl;
 }
 
 void plt_print_all_weights(plt &p){
-    cout << endl << "W:";
-    for (uint64_t i = 0; i <= p.all->weights.mask() + 10; ++i) {
-        cout << " " << p.all->weights.first()[i];
-    }
-    cout << endl;
+//    cout << endl << "W:";
+//    for (uint64_t i = 0; i <= p.all->weights.mask() + 10; ++i) {
+//        cout << " " << p.all->weights.first()[i];
+//    }
+//    cout << endl;
 }
 
 
@@ -180,7 +181,7 @@ void learn(plt& p, base_learner& base, example& ec){
     else
         n_negative.insert(0);
 
-    ec.l.simple = {1.f, 1.f, 0.f};
+    ec.l.simple = {1.f, 0.f, 0.f};
     for (auto &n : n_positive) p.learn_node(p, n, base, ec);
 
     ec.l.simple.label = -1.f;
@@ -207,7 +208,7 @@ inline float predict_node(plt& p, uint32_t n, base_learner& base, example& ec){
     return logit(ec.partial_prediction);
 }
 
-template<bool use_threshold>
+template<bool use_threshold, bool greedy>
 void predict(plt& p, base_learner& base, example& ec){
 
     D_COUT << "PREDICT EXAMPLE\n";
@@ -257,7 +258,38 @@ void predict(plt& p, base_learner& base, example& ec){
         }
     }
 
-        // top-k predictions
+    else if (greedy) {
+        uint32_t current = 0;
+        float current_p = predict_node(p, current, base, ec);
+
+        while(current < p.ti){
+            uint32_t best = 0;
+            float best_p = 0;
+
+            for(uint32_t i = 1; i <= p.kary; ++i) {
+                uint32_t child = p.kary * current + i;
+                float child_p = current_p * predict_node(p, child, base, ec);
+                p.n_visited_nodes += 1;
+
+                if(best_p < child_p){
+                    best = child;
+                    best_p = child_p;
+                }
+            }
+
+            current = best;
+            current_p = best_p;
+        }
+
+        vector<uint32_t> true_labels;
+        for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
+
+        uint32_t label = current - p.ti + 1;
+        if (find(true_labels.begin(), true_labels.end(), label) != true_labels.end())
+            p.precision_at_k[0] += 1.0f;
+    }
+
+    // top-k predictions
     else {
         vector<uint32_t> best_labels, found_leaves;
 	priority_queue<node> node_queue;
@@ -324,6 +356,8 @@ void finish_example(vw& all, plt& p, example& ec){
 	MULTILABEL::print_multilabel_with_score(sink, ec.pred.scalars);
       }
     }
+
+    all.sd->update(ec.test_only, 0.0f, ec.weight, ec.num_features);
     VW::finish_example(all, &ec);
 }
 
@@ -373,8 +407,8 @@ base_learner* plt_setup(vw& all) //learner setup
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
             ("positive_labels", "print all positive labels")
-            ("top_k_labels", "print top-k labels");
-	    
+            ("top_k_labels", "print top-k labels")
+            ("greedy", "greedy prediction");
     add_options(all);
 
     plt& data = calloc_or_throw<plt>();
@@ -382,6 +416,7 @@ base_learner* plt_setup(vw& all) //learner setup
     data.inner_threshold = -1;
     data.positive_labels = false;
     data.top_k_labels = false;
+    data.greedy = false;
     data.all = &all;
 
     data.base_eta = all.eta;
@@ -429,22 +464,35 @@ base_learner* plt_setup(vw& all) //learner setup
     if( all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
 
+    if( all.vm.count("p_at") )
+        data.p_at_k = all.vm["p_at"].as<uint32_t>();
+
     if( all.vm.count("positive_labels"))
         data.positive_labels = true;
 
     if( all.vm.count("top_k_labels"))
         data.top_k_labels = true;
-    
-    if( all.vm.count("p_at") )
-        data.p_at_k = all.vm["p_at"].as<uint32_t>();
+
+    if( all.vm.count("greedy"))
+        data.greedy = true;
+
+
+    // init multiclass learner
+    // -----------------------------------------------------------------------------------------------------------------
 
     if (data.inner_threshold >= 0) {
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true>, all.p, data.t);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true, false>, all.p, data.t);
         l->set_finish(finish<true>);
+    }
+    else if(data.greedy){
+        data.p_at_k = 1;
+        data.precision_at_k.resize(data.p_at_k);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, true>, all.p, data.t);
+        l->set_finish(finish<false>);
     }
     else{
         data.precision_at_k.resize(data.p_at_k);
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false>, all.p, data.t);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false>, all.p, data.t);
         l->set_finish(finish<false>);
     }
 
