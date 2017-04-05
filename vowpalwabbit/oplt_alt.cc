@@ -93,12 +93,12 @@ void oplt_alt_prediction_info(oplt_alt& p, base_learner& base, example& ec){
 }
 
 void oplt_alt_print_all_weights(oplt_alt &p){
-    cout << endl << "WEIGHTS:";
-    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
-        cout << " " << p.all->weights.first()[i];
-        if(!((i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift()))) cout << " | " << endl;
-    }
-    cout << endl;
+//    cout << endl << "WEIGHTS:";
+//    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
+//        cout << " " << p.all->weights.first()[i];
+//        if(!((i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift()))) cout << " | " << endl;
+//    }
+//    cout << endl;
 }
 
 void oplt_alt_tree_info(oplt_alt& p){
@@ -176,7 +176,7 @@ node* node_copy(oplt_alt& p, node *n){
 
 template<bool stride>
 void copy_weights(oplt_alt& p, uint32_t wv1, uint32_t wv2){
-    weight_parameters &weights = p.all->weights;
+    parameters &weights = p.all->weights;
     uint64_t mask = weights.mask();
 
     if(stride){
