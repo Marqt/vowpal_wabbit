@@ -50,6 +50,9 @@ struct plt {
     //bool inference_top_k;
     
     long n_visited_nodes;
+
+    uint32_t ec_count;
+    chrono::time_point<chrono::steady_clock> learn_predict_start_time_point;
 };
 
 // debug helpers - to delete
@@ -85,7 +88,7 @@ void plt_print_all_weights(plt &p){
 // helpers
 //----------------------------------------------------------------------------------------------------------------------
 
-inline float logit(float in) { return 1.0f / (1.0f + exp(-in)); }
+inline float sigmoid(float in) { return 1.0f / (1.0f + exp(-in)); }
 
 
 // save/load
@@ -113,16 +116,13 @@ void save_load_nodes(plt& p, io_buf& model_file, bool read, bool text){
 //----------------------------------------------------------------------------------------------------------------------
 
 void learn_node(plt& p, uint32_t n, base_learner& base, example& ec){
-    D_COUT << "LEARN NODE: " << n << endl;
+    D_COUT << "LEARN NODE: " << n << " LABEL: " << ec.l.simple.label << " WEIGHT: " << ec.weight << " NODE_T: " << p.nodes_t[n] << endl;
 
     p.all->sd->t = p.nodes_t[n];
     p.nodes_t[n] += ec.weight;
 
     base.learn(ec, n);
-
-    //cout << "NODE: " << n << " LABEL " << ec.l.simple.label << endl;
-
-    if(DEBUG) plt_prediction_info(base, ec);
+    ++p.n_visited_nodes;
 }
 
 void learn(plt& p, base_learner& base, example& ec){
@@ -141,9 +141,9 @@ void learn(plt& p, base_learner& base, example& ec){
     if (ec_labels.costs.size() > 0) {
         for (auto& cl : ec_labels.costs) {
             if (cl.class_index > p.k)
-                cout << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
+                cerr << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
 
-            uint32_t tn = cl.class_index + p.ti - 1; // leaf index ( -2 because labels in {1, k})
+            uint32_t tn = cl.class_index + p.ti - 1;
             n_positive.insert(tn);
             while (tn > 0) {
                 tn = floor(static_cast<float>(tn - 1) / p.kary);
@@ -162,8 +162,10 @@ void learn(plt& p, base_learner& base, example& ec){
                 for(uint32_t i = 1; i <= p.kary; ++i) {
                     uint32_t n_child = p.kary * n + i;
 
-                    if (n_positive.find(n_child) != n_positive.end()) n_queue.push(n_child);
-                    else n_negative.insert(n_child);
+                    if(n_child < p.t) {
+                        if (n_positive.find(n_child) != n_positive.end()) n_queue.push(n_child);
+                        else n_negative.insert(n_child);
+                    }
                 }
             }
         }
@@ -194,10 +196,9 @@ inline float predict_node(plt& p, uint32_t n, base_learner& base, example& ec){
 
     ec.l.simple = {FLT_MAX, 0.f, 0.f};
     base.predict(ec, n);
+    ++p.n_visited_nodes;
 
-    if(DEBUG) plt_prediction_info(base, ec);
-
-    return logit(ec.partial_prediction);
+    return sigmoid(ec.partial_prediction);
 }
 
 template<bool use_threshold, bool greedy>
@@ -255,13 +256,12 @@ void predict(plt& p, base_learner& base, example& ec){
         float current_p = predict_node(p, current, base, ec);
 
         while(current < p.ti){
-            uint32_t best = 0;
-            float best_p = 0;
+            uint32_t best = p.kary * current + 1;
+            float best_p = current_p * predict_node(p, best, base, ec);
 
-            for(uint32_t i = 1; i <= p.kary; ++i) {
+            for(uint32_t i = 2; i <= p.kary; ++i) {
                 uint32_t child = p.kary * current + i;
                 float child_p = current_p * predict_node(p, child, base, ec);
-                p.n_visited_nodes += 1;
 
                 if(best_p < child_p){
                     best = child;
@@ -297,7 +297,6 @@ void predict(plt& p, base_learner& base, example& ec){
                 if (best_labels.size() >= p.p_at_k) break;
             } else {
                 float cp = node.p * predict_node(p, node.n, base, ec);
-		        p.n_visited_nodes += 1;
 		
                 if (node.n < p.ti) {
                     for(uint32_t i = 1; i <= p.kary; ++i) {
@@ -363,6 +362,11 @@ void pass_end(plt& p){
 
 template<bool use_threshold>
 void finish(plt& p){
+
+    auto end_time_point = chrono::steady_clock::now();
+    auto execution_time = end_time_point - p.learn_predict_start_time_point;
+    cout << "learn_predict_time = " << static_cast<double>(chrono::duration_cast<chrono::microseconds>(execution_time).count()) / 1000000 << "s\n";
+
     // threshold prediction
     if (use_threshold) {
         if (p.predicted_number > 0) {
@@ -382,8 +386,7 @@ void finish(plt& p){
     }
 
     cout << "visited nodes = " << p.n_visited_nodes << endl;
-
-    delete[] p.nodes_t;
+    free(p.nodes_t);
 }
 
 
@@ -416,6 +419,7 @@ base_learner* plt_setup(vw& all) //learner setup
     data.prediction_count = 0;
     data.p_at_k = 1;
     data.n_visited_nodes = 0;
+    data.ec_count = 0;
 
     // plt parse options
     //------------------------------------------------------------------------------------------------------------------
@@ -456,7 +460,6 @@ base_learner* plt_setup(vw& all) //learner setup
     if( all.vm.count("greedy"))
         data.greedy = true;
 
-
     // init multiclass learner
     // -----------------------------------------------------------------------------------------------------------------
 
@@ -476,7 +479,7 @@ base_learner* plt_setup(vw& all) //learner setup
         l->set_finish(finish<false>);
     }
 
-    data.nodes_t = new float[data.t];
+    data.nodes_t = calloc_or_throw<float>(data.t);
     for(size_t i = 0; i < data.t; ++i) data.nodes_t[i] = all.initial_t;
 
     // override parser
