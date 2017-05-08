@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <unordered_set>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <queue>
@@ -11,6 +12,7 @@
 #include <limits>
 #include <random>
 #include <chrono>
+#include <fstream>
 
 #include "reductions.h"
 #include "vw.h"
@@ -18,48 +20,26 @@
 using namespace std;
 using namespace LEARNER;
 
-#define SKIPS_MUL true
-#define STATS true
+#define REAL double // greater resistance to overflow/underflow on exp and log
+
+static inline float safe_exp(REAL v){
+    errno = 0;
+    REAL _v = exp(v);
+    if(isfinite(_v)) return _v;
+    else return 0; // ?
+}
+
+static inline float safe_log(REAL v){
+    errno = 0;
+    REAL _v = exp(v);
+    if(isfinite(_v)) return _v;
+    else return 0; // ?
+}
+
 #define EXP exp
 #define LOG log
+#define SKIPS_MUL true
 
-#define DEBUG false
-#define D_COUT if(DEBUG) cout
-
-// experimental fast math
-//----------------------------------------------------------------------------------------------------------------------
-
-static inline float
-fasterpow2 (float p)
-{
-    float clipp = (p < -126) ? -126.0f : p;
-    union { uint32_t i; float f; } v = { static_cast<uint32_t> ( (1 << 23) * (clipp + 126.94269504f) ) };
-    return v.f;
-}
-
-static inline float
-fasterexp (float p)
-{
-    return fasterpow2 (1.442695040f * p);
-}
-
-static inline float
-fasterlog2 (float x)
-{
-    union { float f; uint32_t i; } vx = { x };
-    float y = vx.i;
-    y *= 1.1920928955078125e-7f;
-    return y - 126.94269504f;
-}
-
-static inline float
-fasterlog (float x)
-{
-    union { float f; uint32_t i; } vx = { x };
-    float y = vx.i;
-    y *= 8.2629582881927490e-8f;
-    return y - 87.989971088f;
-}
 
 // custom loss class
 //----------------------------------------------------------------------------------------------------------------------
@@ -128,12 +108,12 @@ struct vertex{
     edge* E[MAX_E_OUT];
 
     // for longest path and yen
-    float score;
+    REAL score;
     edge *e_prev;
 
     // for gradients
-    float alpha;
-    float beta;
+    REAL alpha;
+    REAL beta;
 
     bool operator < (const vertex& r) const { return score < r.score; }
 };
@@ -141,21 +121,22 @@ struct vertex{
 struct path{
     uint32_t label;
     vector<edge*> E;
-    float score;
+    REAL score;
 
     bool operator < (const path& r) const { return score < r.score; }
 };
 
 struct model_path{
     uint32_t label;
-    float score;
+    uint32_t ec;
+    REAL score;
     path *p;
 
     bool operator < (const model_path& r) const { return score < r.score; }
 };
 
 
-// struct helpers
+// structs' helpers
 //----------------------------------------------------------------------------------------------------------------------
 
 bool compare_model_path_ptr_func(const model_path* l, const model_path* r) { return (*l < *r); }
@@ -177,12 +158,16 @@ struct model {
     // model's paths and ranking
     uint32_t ranking_size;
     vector<model_path*> P_ranking;
-    priority_queue<model_path*, vector<model_path*>, compare_model_path_ptr_functor> P_potential_ranking;
+    vector<model_path*> P_potential_ranking;
     model_path *P;
     model_path **L;
 
     // model's predictions
     polyprediction* e_pred;
+    set<path*> available_paths;
+
+    // eg
+    float eg_P;
 };
 
 struct ltls {
@@ -209,13 +194,16 @@ struct ltls {
     uint32_t models_to_use;
     model *M;
 
-    bool random_policy;
+    bool random_policy, best_policy, mixed_policy, runtime_path_assignment;
+    float mixed_p;
     ltls_loss_function *loss_function;
 
     uint32_t p_at_k;
     uint32_t max_rank;
 
     vector<uint32_t>(*top_k_ensemble)(ltls& l, uint32_t top_k);
+    vector<model_path*>(*top_k_paths)(ltls& l, model& m, uint32_t top_k);
+    vector<uint32_t> (*ta_top_k)(ltls& l, uint32_t top_k);
 
     // stats
     float precision;
@@ -223,12 +211,29 @@ struct ltls {
     vector<float> precision_at_k;
     size_t learn_count;
     size_t predict_count;
+    bool stats; // more stats
 
     uint32_t get_next_top_count;
     uint32_t get_path_score_count;
     uint32_t sum_rank;
 
     chrono::time_point<chrono::steady_clock> learn_predict_start_time_point;
+    uint32_t pass_count;
+
+    // runtime path assignment
+    default_random_engine rng;
+    unordered_set<uint32_t> seen_labels;
+
+    // eg
+    bool learn_eg;
+    bool predict_eg;
+    float *eg_P;
+    string eg_model;
+
+    // l1_const
+    bool l1_const_reg;
+    float l1_const;
+
 };
 
 
@@ -236,10 +241,6 @@ struct ltls {
 //----------------------------------------------------------------------------------------------------------------------
 
 void init_models(ltls& l){
-    D_COUT << "INIT MODELS\n";
-
-    default_random_engine rng;
-    rng.seed(l.all->random_seed);
 
     l.M = calloc_or_throw<model>(l.ensemble);
     for(uint32_t i = 0; i < l.ensemble; ++i){
@@ -250,18 +251,24 @@ void init_models(ltls& l){
         m.P = calloc_or_throw<model_path>(l.k);
         m.L = calloc_or_throw<model_path*>(l.k);
 
-        for(uint32_t p = 0; p < l.k; ++p){
+        m.eg_P = 1;
+
+        for(uint32_t p = 0; p < l.k; ++p)
             m.P[p].p = l.P[p];
-        }
 
         if(l.random_policy){
             for(uint32_t p = 0; p < l.k - 1; ++p){
                 uniform_int_distribution <uint32_t> dist(p, l.k - 1);
-                size_t swap = dist(rng);
+                size_t swap = dist(l.rng);
                 auto temp = m.P[p];
                 m.P[p] = m.P[swap];
                 m.P[swap] = temp;
             }
+        }
+        else if(l.runtime_path_assignment){
+            m.available_paths = set<path*>();
+            for(auto p : l.P)
+                m.available_paths.insert(p);
         }
 
         for(uint32_t p = 0; p < l.k; ++p){
@@ -306,7 +313,6 @@ vertex* init_vertex(ltls& l){
 }
 
 void init_paths(ltls& l){
-    D_COUT << "INIT PATHS\n";
 
     l._P = calloc_or_throw<path>(l.k);
     l.P.reserve(l.k);
@@ -349,7 +355,6 @@ void init_paths(ltls& l){
 }
 
 void init_graph(ltls& l){
-    D_COUT << "INIT GRAPH\n";
 
     // calc layers, vertices, edges;
     size_t i = 0;
@@ -412,48 +417,55 @@ inline path* get_path(ltls& l, model& m, uint32_t label){
     return m.P[label - 1].p;
 }
 
-void update_path(model& m, path *p){
+inline void update_path(ltls& l, model& m, path *p){
     p->score = 0;
     for(auto e : p->E) {
         //p->score = LOG(EXP(m.e_pred[e->e].scalar) + EXP(p->score));
         p->score += m.e_pred[e->e].scalar;
     }
-    m.L[p->label - 1]->score = p->score;
+    m.L[p->label - 1]->ec = l.predict_count;
+    m.L[p->label - 1]->score = m.eg_P * p->score;
+}
+
+inline void update_path(ltls& l, model& m, model_path *p){
+    update_path(l, m, p->p);
 }
 
 float get_label_score(ltls& l, model& m, uint32_t label){
-    if(STATS) ++l.get_path_score_count;
-    update_path(m, m.P[label - 1].p);
+    if(m.P[label - 1].ec != l.predict_count) {
+        ++l.get_path_score_count;
+        update_path(l, m, m.P[label - 1].p);
+    }
     return m.P[label - 1].score;
 }
 
 model_path* path_from_edges(ltls& l, model& m, vector<edge*> &E){
     uint32_t _label = 0, _layer = 0;
     vertex *_v = l.v_source;
+    float score = 0;
 
     for(auto e = E.rbegin(); e != E.rend(); ++e){
-        for(int j = 0; j < _v->e_out; ++j){
+        for(size_t j = 0; j < _v->e_out; ++j){
             if(_v->E[j] == (*e)){
                 if(j == 1 && _v->E[j]->v_in == l.v_sink) _label += l.layers.back();
                 else if(j == 1) _label += j << _layer;
-                else if(j == 2) for(int k = _layer; k < l.layers.size(); ++k) _label += l.layers[k];
+                else if(j == 2) for(size_t k = _layer; k < l.layers.size(); ++k) _label += l.layers[k];
                 break;
             }
         }
         ++_layer;
         _v = (*e)->v_in;
+        score += m.e_pred[(*e)->e].scalar;
     }
 
-    path *_p = m.L[_label]->p;
-    update_path(m, _p);
+    m.L[_label]->ec = l.predict_count;
+    m.L[_label]->score = m.eg_P * score;
 
     return m.L[_label];
 }
 
 template<bool graph_source>
 vector<edge*> get_top_path_from(ltls& l, model& m, vertex *v_source){
-    D_COUT << "TOP PATH FROM: " << v_source->v << endl;
-
     for(auto v : l.V) v->score = numeric_limits<float>::lowest();
     v_source->score = 0;
     v_source->e_prev = nullptr;
@@ -463,7 +475,6 @@ vector<edge*> get_top_path_from(ltls& l, model& m, vertex *v_source){
             for(uint32_t i = 0; i < _v->e_out; ++i){
                 edge *_e = _v->E[i];
                 //float new_length = LOG(EXP(m.e_pred[_e->e].scalar) + EXP(_v->score));
-                //float new_length = m.e_pred[_e->e].scalar * l.E[i]->skips + _v->score;
                 float new_length = m.e_pred[_e->e].scalar + _v->score;
                 if(_e->v_in->score < new_length){
                     _e->v_in->score = new_length;
@@ -473,8 +484,8 @@ vector<edge*> get_top_path_from(ltls& l, model& m, vertex *v_source){
         }
     }
     else {
-        unordered_set <vertex *> v_set;
-        queue <vertex *> v_queue;
+        unordered_set <vertex*> v_set;
+        queue <vertex*> v_queue;
         v_queue.push(v_source);
 
         while (!v_queue.empty()) {
@@ -510,19 +521,20 @@ vector<edge*> get_top_path_from(ltls& l, model& m, vertex *v_source){
     return top_path;
 }
 
+//yen
 model_path* get_next_top(ltls& l, model& m) {
 
-    if(STATS) ++l.get_next_top_count;
+    ++l.get_next_top_count;
 
     if (m.ranking_size == 0) { // first longest path
         vector<edge*> top_path = get_top_path_from<true>(l, m, l.v_source);
         m.P_ranking.clear();
-        m.P_potential_ranking = priority_queue<model_path*, vector<model_path*>, compare_model_path_ptr_functor>();
+        m.P_potential_ranking.clear();
         m.P_ranking.push_back(path_from_edges(l, m, top_path));
     }
     else { // modified yen's algorithm
         list<edge*> root_path;
-        uint32_t max_spur_edge = min(m.P_ranking.back()->p->E.size(), l.layers.size() - m.ranking_size); // lawler based modification
+        uint32_t max_spur_edge = min(m.P_ranking.back()->p->E.size(), l.layers.size() - m.ranking_size); // [
         for(uint32_t i = 0; i < max_spur_edge; ++i) {
             edge *spur_edge = m.P_ranking.back()->p->E[i];
             vertex *spur_vertex = spur_edge->v_out;
@@ -539,33 +551,83 @@ model_path* get_next_top(ltls& l, model& m) {
 
             if(!all_removed) {
                 vector<edge*> spur_path = get_top_path_from<false>(l, m, spur_vertex);
-                vector<edge*> total_path;
-                total_path.insert(total_path.end(), spur_path.begin(), spur_path.end());
-                total_path.insert(total_path.end(), root_path.begin(), root_path.end());
-
-                m.P_potential_ranking.push(path_from_edges(l, m, total_path));
+                spur_path.insert(spur_path.end(), root_path.begin(), root_path.end());
+                m.P_potential_ranking.push_back(path_from_edges(l, m, spur_path));
             }
 
             root_path.push_front(spur_edge);
             for(auto e : l.E) e->removed = false;
         }
 
-        m.P_ranking.push_back(m.P_potential_ranking.top());
-        m.P_potential_ranking.pop();
+        sort(m.P_potential_ranking.begin(), m.P_potential_ranking.end(), compare_model_path_ptr_func);
+        m.P_ranking.push_back(m.P_potential_ranking.back());
+        m.P_potential_ranking.pop_back();
+        if(m.P_potential_ranking.size() > (l.max_rank - m.ranking_size - 1)){
+            auto erase_end = m.P_potential_ranking.end() - (l.max_rank - m.ranking_size - 1);
+            m.P_potential_ranking.erase(m.P_potential_ranking.begin(), erase_end);
+        }
     }
 
     m.ranking_size = m.P_ranking.size();
     return m.P_ranking.back();
 }
 
+typedef std::pair<REAL, vector<edge*>> score_and_path;
+
+template<bool yen>
 vector<model_path*> top_k_paths(ltls& l, model& m, uint32_t top_k){
-    D_COUT << "TOP " << top_k << " PATHS\n";
 
     vector<model_path*> top_paths;
-    for(uint32_t k = 0; k < top_k; ++k){
-        top_paths.push_back(get_next_top(l, m));
+    if(yen) {
+        l.max_rank = top_k;
+        for (uint32_t k = 0; k < top_k; ++k)
+            top_paths.push_back(get_next_top(l, m));
+    }
+    else{
+        //DO IT BETTER
+
+        for(auto v : l.V) v->score = numeric_limits<float>::lowest();
+
+        priority_queue<score_and_path, vector<score_and_path>> p_queue;
+        vector<edge*> new_path0 = {l.v_source->E[0]};
+        vector<edge*> new_path1 = {l.v_source->E[1]};
+
+        p_queue.push({m.e_pred[l.v_source->E[0]->e].scalar, new_path0});
+        p_queue.push({m.e_pred[l.v_source->E[1]->e].scalar, new_path1});
+
+        while(p_queue.size()){
+            auto p = p_queue.top();
+            p_queue.pop();
+            edge* e = p.second[0];
+            vertex * v = e->v_in;
+
+            if(v == l.v_sink)
+                top_paths.push_back(path_from_edges(l, m, p.second));
+            else {
+                for (uint32_t i = 0; i < v->e_out; ++i) {
+                    edge *_e = v->E[i];
+                    //float new_length = LOG(EXP(m.e_pred[_e->e].scalar) + EXP(_v->score));
+                    float new_length = m.e_pred[_e->e].scalar + p.first;
+                    vector<edge*> new_path = {_e};
+                    new_path.insert(new_path.end(), p.second.begin(), p.second.end());
+                    p_queue.push({new_length, new_path});
+                }
+            }
+
+            if(top_paths.size() > top_k){
+                sort(top_paths.rbegin(), top_paths.rend(), compare_model_path_ptr_func);
+                do{
+                    top_paths.pop_back();
+                } while(top_paths.size() > top_k);
+            }
+        }
     }
 
+    cerr << "tops: ";
+    for(auto p : top_paths){
+        cerr << p->label << "(" << p->score << ") ";
+    }
+    cerr << endl;
     return top_paths;
 }
 
@@ -573,72 +635,214 @@ vector<model_path*> top_k_paths(ltls& l, model& m, uint32_t top_k){
 // ensemble top
 //----------------------------------------------------------------------------------------------------------------------
 
-template<bool single_ltls>
-vector<uint32_t> top_k_ensemble(ltls& l, uint32_t top_k){
-    D_COUT << "TOP ENSEMBLE" << top_k << " PATHS\n";
+template<bool yen>
+vector<uint32_t> ta_top_k(ltls& l, uint32_t top_k){
+    uint32_t rank = 0;
+    unordered_set <uint32_t> seen_labels;
+    vector<pair<float, uint32_t>> _top_labels;
+    float threshold;
 
-    if(single_ltls){
-        vector<model_path*> top_paths = top_k_paths(l, l.M[0], top_k);
+    if(yen) {
+        do {
+            if (rank >= l.max_rank) break;
+            //if(rank == l.k) break; // not really needed
+            ++rank;
+
+            unordered_set <uint32_t> new_labels;
+            threshold = 0;
+
+            for (uint32_t i = 0; i < l.models_to_use; ++i) {
+                model_path *_p = get_next_top(l, l.M[i]);
+                threshold += _p->score;
+
+                if (seen_labels.find(_p->label) == seen_labels.end()) {
+                    new_labels.insert(_p->label);
+                    seen_labels.insert(_p->label);
+                }
+            }
+
+            for (auto label : new_labels) {
+                float label_aggregate_score = 0;
+                for (uint32_t i = 0; i < l.models_to_use; ++i)
+                    label_aggregate_score += get_label_score(l, l.M[i], label);
+                _top_labels.push_back({label_aggregate_score, label});
+            }
+
+            if (_top_labels.size() > top_k) {
+                sort(_top_labels.rbegin(), _top_labels.rend());
+                do {
+                    _top_labels.pop_back();
+                } while (_top_labels.size() > top_k);
+            }
+
+        } while (_top_labels.size() != top_k || _top_labels.back().first < threshold);
+    }
+    else{
+
+        vector<vector<model_path*>> top_models_paths;
+        for (uint32_t i = 0; i < l.models_to_use; ++i)
+            top_models_paths.push_back(l.top_k_paths(l, l.M[i], l.max_rank));
+
+        do {
+            if (rank >= l.max_rank) break;
+            //if(rank == l.k) break; // not really needed
+            ++rank;
+
+            unordered_set <uint32_t> new_labels;
+            threshold = 0;
+
+            for (uint32_t i = 0; i < l.models_to_use; ++i) {
+                model_path *_p = top_models_paths[i][rank - 1];
+                threshold += _p->score;
+
+                if (seen_labels.find(_p->label) == seen_labels.end()) {
+                    new_labels.insert(_p->label);
+                    seen_labels.insert(_p->label);
+                }
+            }
+
+            for (auto label : new_labels) {
+                float label_aggregate_score = 0;
+                for (uint32_t i = 0; i < l.models_to_use; ++i)
+                    label_aggregate_score += get_label_score(l, l.M[i], label);
+                _top_labels.push_back({label_aggregate_score, label});
+            }
+
+            if (_top_labels.size() > top_k) {
+                sort(_top_labels.rbegin(), _top_labels.rend());
+                do {
+                    _top_labels.pop_back();
+                } while (_top_labels.size() > top_k);
+            }
+
+        } while (_top_labels.size() != top_k || _top_labels.back().first < threshold);
+    }
+
+    vector<uint32_t> top_labels;
+    for(auto p : _top_labels) top_labels.push_back(p.second);
+
+    l.sum_rank += rank;
+    return top_labels;
+}
+
+template<bool min>
+vector<uint32_t> max_min_top_k(ltls& l, uint32_t top_k){
+    unordered_map <uint32_t, float> seen_labels;
+    vector<pair<float, uint32_t>> _top_labels;
+    vector<uint32_t> top_labels;
+
+    do{
+        for(uint32_t i = 0; i < l.models_to_use; ++i) {
+            model_path *_p = get_next_top(l, l.M[i]);
+            if(seen_labels.find(_p->label) == seen_labels.end())
+                seen_labels.insert({_p->label, _p->score});
+            else{
+                if(min) {
+                    if (seen_labels[_p->label] > _p->score)
+                        seen_labels[_p->label] = _p->score;
+                }
+                else{
+                    if (seen_labels[_p->label] < _p->score)
+                        seen_labels[_p->label] = _p->score;
+                }
+            }
+        }
+    } while (seen_labels.size() < l.max_rank);
+
+    for(auto l : seen_labels)
+        _top_labels.push_back({l.second, l.first});
+
+    sort(_top_labels.rbegin(), _top_labels.rend());
+
+    for(size_t i = 0; i < top_k; ++i)
+        top_labels.push_back(_top_labels[i].second);
+
+    return top_labels;
+}
+
+vector<uint32_t> avg_top_k(ltls& l, uint32_t top_k){
+    unordered_map <uint32_t, pair<float, uint32_t>> seen_labels;
+    vector<pair<float, uint32_t>> _top_labels;
+    vector<uint32_t> top_labels;
+
+    for(uint32_t i = 0; i < l.max_rank; ++i) {
+        for(uint32_t j = 0; j < l.models_to_use; ++j) {
+            model_path *_p = get_next_top(l, l.M[j]);
+            if(seen_labels.find(_p->label) == seen_labels.end())
+                seen_labels.insert({_p->label, {_p->score, 1}});
+            else {
+                seen_labels[_p->label].first += _p->score;
+                ++seen_labels[_p->label].second;
+            }
+        }
+    }
+
+    for(auto l : seen_labels)
+        _top_labels.push_back({l.second.first/l.second.second, l.first});
+
+    sort(_top_labels.rbegin(), _top_labels.rend());
+
+    for(size_t i = 0; i < top_k; ++i)
+        top_labels.push_back(_top_labels[i].second);
+
+    return top_labels;
+}
+
+template<bool single, bool ta, bool max, bool min, bool avg>
+vector<uint32_t> top_k_ensemble(ltls& l, uint32_t top_k){
+    if(single){
+        vector<model_path*> top_paths = l.top_k_paths(l, l.M[0], top_k);
         vector<uint32_t> top_labels;
         for(auto p : top_paths) top_labels.push_back(p->label);
         return top_labels;
     }
-    else { // threshold algorithm
-        int rank = 0;
-        unordered_set <uint32_t> seen_labels;
-        vector<pair<float, uint32_t>> _top_labels;
-        float threshold;
-
-        do {
-            if(rank >= l.max_rank) break;
-            //if(rank == l.k) break; // not really needed
-            ++rank;
-
-            vector<model_path*> paths_at_rank;
-            unordered_map<uint32_t, pair<uint32_t, float>> random_except;
-            unordered_set<uint32_t> new_labels;
-
-            for(uint32_t i = 0; i < l.models_to_use; ++i) {
-                model_path *_p = get_next_top(l, l.M[i]);
-                paths_at_rank.push_back(_p);
-                random_except.insert({_p->label, {i, _p->score}});
-
-                if (seen_labels.find(_p->label) == seen_labels.end()) new_labels.insert(_p->label);
-                seen_labels.insert(_p->label);
-            }
-
-            for(auto label : new_labels) {
-                float label_aggregate_score = 0;
-                for(uint32_t i = 0; i < l.models_to_use; ++i) {
-                    if (i == random_except[label].first) label_aggregate_score += random_except[label].second;
-                    else label_aggregate_score += get_label_score(l, l.M[i], label);
-                }
-                _top_labels.push_back({label_aggregate_score, label});
-            }
-
-            sort(_top_labels.rbegin(), _top_labels.rend());
-            while (_top_labels.size() > top_k) _top_labels.pop_back();
-
-            threshold = 0;
-            for(auto p : paths_at_rank) threshold += p->score;
-
-        } while (_top_labels.size() != top_k || _top_labels.back().first < threshold);
-
-        vector<uint32_t> top_labels;
-        for(auto p : _top_labels) top_labels.push_back(p.second);
-
-        l.sum_rank += rank;
-
-        return top_labels;
-    }
+    else if(max)
+        return max_min_top_k<false>(l, top_k);
+    else if(min)
+        return max_min_top_k<true>(l, top_k);
+    else if(avg)
+        return avg_top_k(l, top_k);
+    else //if(ta)
+        return l.ta_top_k(l, top_k);
 }
+
 
 // learn
 //----------------------------------------------------------------------------------------------------------------------
 
-inline void evaluate(ltls& l, model& m, base_learner& base, example& ec) {
-    D_COUT << "EVALUATE ALL THE EDGES\n";
+void add_new_label(ltls& l, uint32_t label) {
 
+    l.seen_labels.insert(label);
+    uniform_real_distribution <float> real_dist(0.f, 1.f);
+
+    for(uint32_t i = 0; i < l.ensemble; ++i) {
+        model& m = l.M[i];
+        path* path_to_assign;
+        bool select_randomly = true;
+
+        if(l.best_policy || real_dist(l.rng) < l.mixed_p){ // best assignment
+            for(size_t j = 0; j < log2(l.k); ++j){
+                auto path_candidate = get_next_top(l, m)->p;
+                if(m.available_paths.find(path_candidate) != m.available_paths.end()){
+                    path_to_assign = path_candidate;
+                    select_randomly = false;
+                    continue;
+                }
+            }
+        }
+
+        if(select_randomly){ // random assignment
+            uniform_int_distribution <uint32_t> int_dist(0, m.available_paths.size() - 1);
+            auto p = int_dist(l.rng);
+            path_to_assign = *next(m.available_paths.begin(), p);
+        }
+
+        m.available_paths.erase(path_to_assign);
+        m.P[label - 1].p = path_to_assign;
+    }
+}
+
+inline void evaluate(ltls& l, model& m, base_learner& base, example& ec) {
     m.ranking_size = 0;
     ec.l.simple = {FLT_MAX, 0.f, 0.f};
     base.multipredict(ec, m.base, l.e, m.e_pred, false);
@@ -651,12 +855,12 @@ void compute_gradients(ltls& l, model& m, COST_SENSITIVE::label &ec_labels){
     l.v_source->alpha = l.v_sink->beta = 0;
 
     for(auto e : l.E){
-        float path_length = e->v_out->alpha + m.e_pred[e->e].scalar;
+        REAL path_length = e->v_out->alpha + m.e_pred[e->e].scalar;
         e->v_in->alpha = LOG(EXP(e->v_in->alpha) + EXP(path_length));
     }
 
     for(auto e = l.E.rbegin(); e != l.E.rend(); ++e){
-        float path_length = (*e)->v_in->beta + m.e_pred[(*e)->e].scalar;
+        REAL path_length = (*e)->v_in->beta + m.e_pred[(*e)->e].scalar;
         (*e)->v_out->beta = LOG(EXP((*e)->v_out->beta) + EXP(path_length));
     }
 
@@ -667,9 +871,9 @@ void compute_gradients(ltls& l, model& m, COST_SENSITIVE::label &ec_labels){
     }
 
     for(auto e : l.E){
-        float yuv = 0;
+        REAL yuv = 0;
         if(positive_edges.find(e) != positive_edges.end()) yuv = 1;
-        float puvx = EXP(e->v_out->alpha + m.e_pred[e->e].scalar + e->v_in->beta - l.v_sink->alpha);
+        REAL puvx = EXP(e->v_out->alpha + m.e_pred[e->e].scalar + e->v_in->beta - l.v_sink->alpha);
         e->gradient = yuv - puvx;
     }
 }
@@ -684,57 +888,143 @@ void update_edges(ltls& l, model& m, base_learner& base, example& ec){
 }
 
 void learn(ltls& l, base_learner& base, example& ec){
-    D_COUT << "LEARN EXAMPLE\n";
 
-    if(STATS && !l.learn_count) l.learn_predict_start_time_point = chrono::steady_clock::now();
+    if(!l.learn_count) l.learn_predict_start_time_point = chrono::steady_clock::now();
+    ++l.learn_count;
 
     COST_SENSITIVE::label ec_labels = ec.l.cs; // copy is needed to restore example later
     if (!ec_labels.costs.size()) return;
 
+    for(uint32_t i = 0; i < l.ensemble; ++i)
+        evaluate(l, l.M[i], base, ec);
+
+    if(l.pass_count == 0 && l.runtime_path_assignment) {
+        for (auto &cl : ec_labels.costs) {
+            if (l.seen_labels.find(cl.class_index) == l.seen_labels.end()) {
+                add_new_label(l, cl.class_index);
+            }
+        }
+    }
+
     for(uint32_t i = 0; i < l.ensemble; ++i) {
         model& m = l.M[i];
-
-        evaluate(l, m, base, ec);
         ec.loss = l.loss_function->loss = 1;
-
         compute_gradients(l, m, ec_labels);
         update_edges(l, m, base, ec);
     }
 
     ec.l.cs = ec_labels;
     ec.pred.multiclass = 0;
-
-    D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
 
 // predict
 //----------------------------------------------------------------------------------------------------------------------
 
-void predict(ltls& l, base_learner& base, example& ec){
-    D_COUT << "PREDICT EXAMPLE\n";
+void l1_const_reg(ltls& l){
+    parameters &weights = l.all->weights;
+    uint32_t stride_shift = weights.stride_shift();
+    uint64_t mask = weights.mask() >> stride_shift;
 
-    if(STATS && !l.predict_count) l.learn_predict_start_time_point = chrono::steady_clock::now();
+    for (uint64_t i = 0; i <= mask; ++i) {
+        uint64_t idx = (i << stride_shift);
+        if(fabs(weights[idx]) < l.l1_const) weights[idx] = 0;
+    }
+}
+
+void predict(ltls& l, base_learner& base, example& ec){
+
+    if(!l.predict_count){
+        if(l.l1_const_reg) l1_const_reg(l);
+        l.learn_predict_start_time_point = chrono::steady_clock::now();
+    }
+    ++l.predict_count;
 
     COST_SENSITIVE::label ec_labels = ec.l.cs;
 
     for(uint32_t i = 0; i < l.models_to_use; ++i) evaluate(l, l.M[i], base, ec);
     auto top_paths = l.top_k_ensemble(l, l.p_at_k);
 
-    if(STATS) {
-        vector <uint32_t> true_labels;
-        for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
+    vector <uint32_t> true_labels;
+    for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
 
-        if (l.p_at_k > 0 && true_labels.size() > 0) {
-            for (size_t i = 0; i < l.p_at_k; ++i) {
-                if (find(true_labels.begin(), true_labels.end(), top_paths[i]) != true_labels.end())
-                    l.precision_at_k[i] += 1.0f;
-            }
+    if (l.p_at_k > 0 && true_labels.size() > 0) {
+        for (size_t i = 0; i < l.p_at_k; ++i) {
+            if (find(true_labels.begin(), true_labels.end(), top_paths[i]) != true_labels.end())
+                l.precision_at_k[i] += 1.0f;
         }
     }
 
-    ++l.predict_count;
     ec.l.cs = ec_labels;
     ec.pred.multiclass = top_paths.front();
+}
+
+
+// EG
+//----------------------------------------------------------------------------------------------------------------------
+
+void init_eg(ltls& l){
+    l.eg_P = calloc_or_throw<float>(l.models_to_use);
+    for(size_t i = 0; i < l.models_to_use; ++i)
+        l.eg_P[i] = 1.f/l.models_to_use;
+
+    cerr << "eg_model = " << l.eg_model << endl;
+
+    if(l.predict_eg){
+        auto eg_model = ifstream(l.eg_model, ios::binary);
+        if(eg_model.good()) {
+            uint32_t models_to_use;
+            eg_model.read((char*) &models_to_use, sizeof(uint32_t));
+
+            if(models_to_use != l.models_to_use)
+                cerr << "Something is wrong with eg_model!\n";
+
+            for(size_t i = 0; i < l.models_to_use; ++i)
+                eg_model.read((char*) &l.eg_P[i], sizeof(float));
+
+            eg_model.close();
+        }
+        else
+            cerr << "Eg model not found!\n";
+
+        cerr << "eg_weights = [ ";
+        for(size_t i = 0; i < l.models_to_use; ++i) {
+            l.M[i].eg_P = l.eg_P[i];
+            cerr << l.eg_P[i] << " ";
+        }
+        cerr << "]\n";
+    }
+}
+
+void learn_eg(ltls& l, base_learner& base, example& ec) {
+
+    float *x;
+    x = calloc_or_throw<float>(l.models_to_use);
+    float Px = 0;
+    float sumxPx = 0;
+
+    if(!l.predict_count) l.learn_predict_start_time_point = chrono::steady_clock::now();
+    COST_SENSITIVE::label ec_labels = ec.l.cs;
+
+    float eg_eta = l.all->eta;
+
+    for(size_t i = 0; i < l.models_to_use; ++i){
+        model &m = l.M[i];
+        evaluate(l, m, base, ec);
+
+        auto p = get_path(l, m, ec_labels.costs[0].class_index);
+        update_path(l, m, p);
+        x[i] = p->score;
+        Px += l.eg_P[i] * x[i];
+    }
+
+    for(size_t i = 0; i < l.models_to_use; ++i)
+        sumxPx += l.eg_P[i] * exp(eg_eta * (x[i]/Px));
+
+    for(size_t i = 0; i < l.models_to_use; ++i)
+        l.eg_P[i] = l.eg_P[i] * exp(eg_eta * (x[i]/Px)) / sumxPx;
+
+    ++l.predict_count;
+    ec.l.cs = ec_labels;
 }
 
 
@@ -747,24 +1037,149 @@ void finish_example(vw& all, ltls& l, example& ec) {
 }
 
 void end_pass(ltls& l){
-    cout << "end of pass " << l.all->passes_complete << "\n";
+    ++l.pass_count;
+    cerr << "end of pass " << l.pass_count << endl;
+}
+
+void w_stats(ltls& l){
+    parameters &weights = l.all->weights;
+    uint32_t stride_shift = weights.stride_shift();
+    uint64_t mask = weights.mask();
+
+    cerr << "bits = " << l.all->num_bits << endl;
+    cerr << "bits_size = " << static_cast<uint64_t>(pow(2, l.all->num_bits) - 1) << endl;
+    cerr << "mask = " << mask << endl;
+    cerr << "stride_shift = " << stride_shift << endl;
+}
+
+void w_ranges_stats(ltls& l){
+
+    double w_avg = 0;
+    uint64_t w_count = 0;
+    uint64_t w_nonzero = 0;
+    float w_ranges[] = {5, 2.5, 1, 0.75, 0.5, 0.25, 0.1, 0.05, 0.01, 0.005, 0.001, 0, -0.001, -0.005, -0.01, -0.05, -0.1, -0.25, -0.5, -0.75, -1, -2.5, -5, -100};
+    uint64_t w_ranges_count[] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+    parameters &weights = l.all->weights;
+    uint32_t stride_shift = weights.stride_shift();
+    uint64_t mask = weights.mask() >> stride_shift;
+
+    cerr << "stride_shift = " << stride_shift << endl;
+    for (uint64_t i = 0; i <= mask; ++i) {
+        uint64_t idx = (i << stride_shift);
+        w_avg += weights[idx];
+        ++w_count;
+        if(weights[idx] != 0) ++w_nonzero;
+        for(size_t k = 0; k < 24; ++k) {
+            if (weights[idx] >= w_ranges[k]) {
+                ++w_ranges_count[k];
+                break;
+            }
+        }
+    }
+
+    cerr << "w_avg = " << w_avg/w_count << "\nw_count = " << w_count << "\nw_nonzero = " << w_nonzero << endl;
+    for(size_t k = 0; k < 24; ++k)
+        cerr << "gt or eq " << w_ranges[k] << " = " << w_ranges_count[k] << endl;
+}
+
+void model_size(ltls& l){
+    long long model_size1, model_size2;
+    model_size1 = model_size2 = l.models_to_use * l.k * sizeof(uint32_t);
+
+    uint32_t predictors_shift = static_cast<uint32_t>(floor(log2(static_cast<float>(l.e * l.ensemble)))) + 1;
+    parameters &weights = l.all->weights;
+    uint32_t stride_shift = weights.stride_shift();
+    uint64_t w_mask = weights.mask() >> stride_shift;
+    uint32_t f_mask = w_mask >> predictors_shift;
+
+    cerr << "w_mask = " << w_mask << endl;
+    cerr << "f_mask = " << f_mask << endl;
+
+    bool prev_0 = false;
+    for (uint64_t i = 0; i <= f_mask; ++i) {
+        uint64_t idx = (i << predictors_shift);
+        for(uint64_t j = 0; j < l.models_to_use * l.e; ++j){
+            size_t w = j << stride_shift;
+            if(weights[idx + w] != 0){
+                model_size1 += sizeof(float);
+                prev_0 = false;
+            }
+            else if(!prev_0) {
+                model_size1 += sizeof(float) + sizeof(uint64_t);
+                prev_0 = true;
+            }
+
+            model_size2 += sizeof(float);
+        }
+    }
+
+    cerr << "model_size_features = " << static_cast<float>(model_size1)/1024/1024 << "MB\n";
+    cerr << "model_size_uncompressed_features = " << static_cast<float>(model_size2)/1024/1024 << "MB\n";
+
+    model_size1 = model_size2 = l.models_to_use * l.k * sizeof(uint32_t);
+
+    prev_0 = false;
+    for(uint64_t j = 0; j < l.models_to_use * l.e; ++j){
+        size_t w = j << stride_shift;
+
+        for (uint64_t i = 0; i <= f_mask; ++i) {
+            uint64_t idx = (i << predictors_shift);
+
+            if(weights[idx + w] != 0){
+                model_size1 += sizeof(float);
+                prev_0 = false;
+            }
+            else if(!prev_0) {
+                model_size1 += sizeof(float) + sizeof(uint64_t);
+                prev_0 = true;
+            }
+
+            model_size2 += sizeof(float);
+        }
+    }
+
+    cerr << "model_size_predictors = " << static_cast<float>(model_size1)/1024/1024 << "MB\n";
+    cerr << "model_size_uncompressed_predictors = " << static_cast<float>(model_size2)/1024/1024 << "MB\n";
 }
 
 void finish(ltls& l){
-    if(STATS){
-        float correct = 0;
-        for(size_t i = 0; i < l.p_at_k; ++i) {
-            correct += l.precision_at_k[i];
-            cout << "P@" << i + 1 << " = " << correct / (l.predict_count * (i + 1)) << endl;
+    auto end_time_point = chrono::steady_clock::now();
+    auto execution_time = end_time_point - l.learn_predict_start_time_point;
+    cerr << "learn_predict_time = " << static_cast<double>(chrono::duration_cast<chrono::microseconds>(execution_time).count()) / 1000000 << "s\n";
+
+    float correct = 0;
+    for(size_t i = 0; i < l.p_at_k; ++i) {
+        correct += l.precision_at_k[i];
+        cerr << "P@" << i + 1 << " = " << correct / (l.predict_count * (i + 1)) << endl;
+    }
+
+    cerr << "get_next_top_count = " << l.get_next_top_count << "\nget_path_score_count = " << l.get_path_score_count << endl;
+    float average_rank = static_cast<float>(l.sum_rank)/l.predict_count;
+    cerr << "average_rank = " << average_rank << endl;
+
+    if(l.stats) {
+        w_stats(l);
+        w_ranges_stats(l);
+        model_size(l);
+    }
+
+    if(l.learn_eg){
+        cerr << "eg_weights = [ ";
+        for(size_t i = 0; i < l.models_to_use; ++i) {
+            cerr << l.eg_P[i] << " ";
         }
+        cerr << "]\n";
 
-        cout << "get_next_top_count = " << l.get_next_top_count << "\nget_path_score_count = " << l.get_path_score_count << endl;
-        float average_rank = static_cast<float>(l.sum_rank)/l.predict_count;
-        cout << "average_rank = " << average_rank << endl;
+        auto eg_model = ofstream(l.eg_model, ios::binary);
+        if(eg_model.good()) {
+            eg_model.write((char*) &l.models_to_use, sizeof(uint32_t));
+            //eg_model.write((char*) &l.eg_P, l.models_to_use * sizeof(float));
+            for(size_t i = 0; i < l.models_to_use; ++i)
+                eg_model.write((char*) &l.eg_P[i], sizeof(float));
 
-        auto end_time_point = chrono::steady_clock::now();
-        auto learn_predict_time = end_time_point - l.learn_predict_start_time_point;
-        cout << "learn_predict_time = " << static_cast<double>(chrono::duration_cast<chrono::microseconds>(learn_predict_time).count()) / 1000000 << "s\n";
+            eg_model.close();
+        }
     }
 
 //    for(size_t i = 0; i < l.ensemble; ++i){
@@ -779,8 +1194,7 @@ void finish(ltls& l){
 //    free(l._P);
 }
 
-void save_load_graph(ltls& l, io_buf& model_file, bool read, bool text){
-    D_COUT << "SAVE/LOAD\n";
+void save_load_graphs(ltls& l, io_buf& model_file, bool read, bool text){
 
     if (model_file.files.size() > 0) {
         bool resume = l.all->save_resume;
@@ -802,9 +1216,17 @@ void save_load_graph(ltls& l, io_buf& model_file, bool read, bool text){
                     m.L[m.P[p].p->label - 1] = &m.P[p];
                 }
             }
+
+//            cout << "MODEL " << i << " = [ ";
+//            for(uint32_t p = 0; p < l.k; ++p){
+//                cout << m.P[p].label << "(" << m.P[p].p->label << ") ";
+//            }
+//            cout << "]\n";
+
         }
     }
 }
+
 
 // setup
 //----------------------------------------------------------------------------------------------------------------------
@@ -817,34 +1239,53 @@ base_learner* ltls_setup(vw& all) //learner setup
             ("ensemble", po::value<uint32_t>(), "number of ltls to ensemble (default 1)")
             ("models_to_use", po::value<uint32_t>(), "number of ltls to use in ensemble (default --ensemble value)")
             ("max_rank", po::value<uint32_t>(), "max rank in threshold algorithm (default --p_at value)")
+            ("p_at", po::value<uint32_t>(), "P@k (default 1)")
+            ("l1_const", po::value<float>(), "")
+            ("stats", "")
+
+            // learning policy
             ("inorder_policy", "inorder path assignment policy")
             ("random_policy", "random path assignment policy")
             ("best_policy", "best possible path assignment policy")
             ("mixed_policy", po::value<float>(), "random mixed with best possible path policy")
-            ("p_at", po::value<uint32_t>(), "P@k (default 1)");
+
+            // prediction policy
+            ("yen", "use yen")
+            ("learn_eg", po::value<string>(), "learn eg for ensemble")
+            ("predict_eg", po::value<string>(), "predict using eg model for ensemble")
+            ("ta_policy", "threshold algorithm policy")
+            ("max_policy", "max score from x(max_rank) unique obtained")
+            ("min_policy", "min score from x(max_rank) unique obtained")
+            ("avg_policy", "avg of scores from top x(max_rank) obtained");
     add_options(all);
 
     ltls& data = calloc_or_throw<ltls>();
 
-    if(STATS){
-        data.get_next_top_count = 0;
-        data.get_path_score_count = 0;
-        data.predict_count = 0;
-        data.learn_count = 0;
-    }
-
     data.k = all.vm["ltls"].as<size_t>();
     data.ensemble = 1;
-    data.random_policy = false;
+    data.random_policy = data.best_policy = false;
     data.all = &all;
 
     data.precision = 0;
     data.predicted_number = 0;
     data.predict_count = 0;
     data.p_at_k = 1;
+    data.pass_count = 0;
+    data.l1_const_reg = false;
+    data.rng.seed(all.random_seed);
+
+    data.seen_labels = unordered_set<uint32_t>();
+
+    data.stats = false;
+    data.get_next_top_count = 0;
+    data.get_path_score_count = 0;
+    data.predict_count = 0;
+    data.learn_count = 0;
 
     // ltls parse options
     //------------------------------------------------------------------------------------------------------------------
+
+    if(all.vm.count("stats")) data.stats = true;
 
     learner<ltls> *l;
     string path_assignment_policy = "inorder_policy";
@@ -855,8 +1296,23 @@ base_learner* ltls_setup(vw& all) //learner setup
 
     if(all.vm.count("models_to_use")) data.models_to_use = all.vm["models_to_use"].as<uint32_t>();
     if(data.models_to_use > data.ensemble) data.models_to_use = data.ensemble;
-    if(data.models_to_use == 1) data.top_k_ensemble = top_k_ensemble<true>;
-    else data.top_k_ensemble = top_k_ensemble<false>;
+    if(data.models_to_use == 1) data.top_k_ensemble = top_k_ensemble<true, false, false, false, false>;
+    else{
+        if(all.vm.count("max_policy")) data.top_k_ensemble = top_k_ensemble<false, false, true, false, false>;
+        if(all.vm.count("min_policy")) data.top_k_ensemble = top_k_ensemble<false, false, false, true, false>;
+        if(all.vm.count("avg_policy")) data.top_k_ensemble = top_k_ensemble<false, false, false, false, true>;
+        else //if(all.vm.count("ta_policy"))
+            data.top_k_ensemble = top_k_ensemble<false, true, false, false, false>;
+    }
+
+    if(all.vm.count("yen")){
+        data.top_k_paths = top_k_paths<true>;
+        data.ta_top_k = ta_top_k<true>;
+    }
+    else{
+        data.top_k_paths = top_k_paths<false>;
+        data.ta_top_k = ta_top_k<false>;
+    }
 
     if( all.vm.count("p_at") ) data.p_at_k = all.vm["p_at"].as<uint32_t>();
     data.precision_at_k.resize(data.p_at_k);
@@ -864,11 +1320,29 @@ base_learner* ltls_setup(vw& all) //learner setup
 
     if( all.vm.count("max_rank") ) data.max_rank = all.vm["max_rank"].as<uint32_t>();
 
-    if(all.vm.count("random_policy") || data.ensemble > 1) {
+    if(all.vm.count("inorder_policy")) {
+        *(all.file_options) << " --inorder_policy";
+    }
+    else if(all.vm.count("best_policy")) {
+        path_assignment_policy = "best_policy";
+        data.best_policy = true;
+    }
+    else if(all.vm.count("mixed_policy")) {
+        path_assignment_policy = "mixed_policy";
+        data.mixed_p = all.vm["mixed_policy"].as<float>();
+        data.mixed_policy = true;
+    }
+    else if(all.vm.count("random_policy") || data.ensemble) {
         path_assignment_policy = "random_policy";
         data.random_policy = true;
-        //*(all.file_options) << " --random_policy";
     }
+
+    if(all.vm.count("l1_const")) {
+        data.l1_const_reg = true;
+        data.l1_const = all.vm["l1_const"].as<float>();
+    }
+
+    data.runtime_path_assignment = data.best_policy || data.mixed_policy;
 
     // ltls init graph and paths
     //------------------------------------------------------------------------------------------------------------------
@@ -880,7 +1354,21 @@ base_learner* ltls_setup(vw& all) //learner setup
     data.loss_function = new ltls_loss_function();
     all.loss = data.loss_function;
 
-    l = &init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.e * data.ensemble);
+    if(all.vm.count("learn_eg")) {
+        data.learn_eg = true;
+        data.eg_model = all.vm["learn_eg"].as<string>();
+        init_eg(data);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, learn_eg, all.p, data.e * data.ensemble);
+    }
+    else if(all.vm.count("predict_eg")) {
+        data.predict_eg = true;
+        data.eg_model = all.vm["predict_eg"].as<string>();
+        init_eg(data);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.e * data.ensemble);
+    }
+    else
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict, all.p, data.e * data.ensemble);
+
 
     // override parser
     //------------------------------------------------------------------------------------------------------------------
@@ -890,21 +1378,22 @@ base_learner* ltls_setup(vw& all) //learner setup
 
     all.holdout_set_off = true; // turn off stop based on holdout loss
 
+
     // log info & add some event handlers
     //------------------------------------------------------------------------------------------------------------------
 
-    cout << "ltls\nk = " << data.k << "\nv = " << data.v
+    cerr << "ltls\nk = " << data.k << "\nv = " << data.v
          << "\ne = " << data.e << "\nlayers = " << data.layers.size() << endl;
 
     if(data.ensemble > 1) {
-        cout << "ensemble = " << data.ensemble
+        cerr << "ensemble = " << data.ensemble
              << "\nmodels_to_use = " << data.models_to_use
              << "\nmax_rank = " << data.max_rank << endl;
     }
 
-    if(path_assignment_policy.length()) cout << path_assignment_policy << endl;
+    if(path_assignment_policy.length()) cerr << path_assignment_policy << endl;
 
-    l->set_save_load(save_load_graph);
+    l->set_save_load(save_load_graphs);
     l->set_finish_example(finish_example);
     l->set_end_pass(end_pass);
     l->set_finish(finish);
