@@ -87,73 +87,42 @@ struct oplt {
 //----------------------------------------------------------------------------------------------------------------------
 
 void oplt_example_info(oplt& p, base_learner& base, example& ec){
-//    cerr << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features
-//         << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
-//
-//    cerr << "BW: " << base.weights << " BI: " << base.increment
-//         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
-//
-//    for (features &fs : ec) {
-//        for (features::iterator_all &f : fs.values_indices_audit())
-//            cerr << "FEATURE: " << (f.index() & p.all->weights.mask()) << " VALUE: " << f.value() << endl;
-//    }
-//    for (auto &cl : ec.l.cs.costs) cerr << "LABEL: " << cl.class_index << endl;
-}
+    cerr << "TAG: " << (ec.tag.size() ? std::string(ec.tag.begin()) : "-") << " FEATURES COUNT: " << ec.num_features
+         << " LABELS COUNT: " << ec.l.cs.costs.size() << endl;
 
-void oplt_prediction_info(oplt& p, base_learner& base, example& ec){
-//    cerr << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
-//         << " L: " << ec.loss << " S: " << ec.pred.scalar << " ETA: " << p.all->eta << endl;
-}
+    cerr << "BW: " << base.weights << " BI: " << base.increment
+         << " WSS: " << p.all->weights.stride_shift() << " WM: " << p.all->weights.mask() << endl;
 
-void oplt_print_all_weights(oplt &p, bool show_temp = false){
-//    cerr << endl << "WEIGHTS:";
-//    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
-//        size_t j = i % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
-//
-//        bool show = false;
-//        bool temp = false;
-//        bool inverted = false;
-//        size_t base = 0;
-//        for(auto n : p.tree){
-//            if(n->temp && n->temp->base_predictor == j) temp = true;
-//            if(n->base_predictor == j){
-//                inverted = n->inverted;
-//                base = n->base_predictor;
-//                show = true;
-//            }
-//        }
-//
-//        j = (i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
-//
-//        if(show && (!temp || show_temp)) cerr << "\t(" << base << ") " << (inverted ? -1 : 1) * p.all->weights.first()[i];
-//        if(!j) cerr << " | " << endl;
-//    }
-//    cerr << endl;
+    for (features &fs : ec) {
+        for (features::iterator_all &f : fs.values_indices_audit())
+            cerr << "FEATURE: " << (f.index() & p.all->weights.mask()) << " VALUE: " << f.value() << endl;
+    }
+    for (auto &cl : ec.l.cs.costs) cerr << "LABEL: " << cl.class_index << endl;
 }
 
 void oplt_tree_info(oplt& p){
-//    cerr << "TREE SIZE: " << p.tree.size() << " TREE LEAVES: " << p.tree_leaves.size() << "\nTREE:\n";
-//    queue<node*> n_queue;
-//    n_queue.push(p.tree_root);
-//
-//    size_t depth = 0;
-//    while(!n_queue.empty()) {
-//        size_t q_size = n_queue.size();
-//        cerr << "DEPTH " << depth << ": ";
-//        for(size_t i = 0; i < q_size; ++i){
-//            node *n = n_queue.front();
-//            n_queue.pop();
-//
-//            if(n->parent) cerr << "[" << n->parent->base_predictor << "]";
-//            cerr << n->base_predictor;
-//            if(!n->internal) cerr << "(" << n->label << ")";
-//            cerr << " ";
-//
-//            for(auto c : n->children) n_queue.push(c);
-//        }
-//        ++depth;
-//        cerr << endl;
-//    }
+    cerr << "TREE SIZE: " << p.tree.size() << " TREE LEAVES: " << p.tree_leaves.size() << "\nTREE:\n";
+    queue<node*> n_queue;
+    n_queue.push(p.tree_root);
+
+    size_t depth = 0;
+    while(!n_queue.empty()) {
+        size_t q_size = n_queue.size();
+        cerr << "DEPTH " << depth << ": ";
+        for(size_t i = 0; i < q_size; ++i){
+            node *n = n_queue.front();
+            n_queue.pop();
+
+            if(n->parent) cerr << "[" << n->parent->base_predictor << "]";
+            cerr << n->base_predictor;
+            if(!n->internal) cerr << "(" << n->label << ")";
+            cerr << " ";
+
+            for(auto c : n->children) n_queue.push(c);
+        }
+        ++depth;
+        cerr << endl;
+    }
 }
 
 
@@ -210,7 +179,7 @@ node* node_copy(oplt& p, node *n){
 
 template<bool stride>
 void copy_weights(oplt& p, uint32_t wv1, uint32_t wv2){
-    weight_parameters &weights = p.all->weights;
+    parameters &weights = p.all->weights;
     uint64_t mask = weights.mask();
 
     if(stride){
@@ -599,9 +568,6 @@ void learn(oplt& p, base_learner& base, example& ec){
 
     ec.l.simple.label = -1.f;
     for (auto &n : n_negative) learn_node(p, n, base, ec);
-
-
-    if(DEBUG) oplt_print_all_weights(p);
 
     ec.l.cs = ec_labels;
     p.all->sd->t = t;

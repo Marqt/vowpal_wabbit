@@ -96,43 +96,6 @@ void oplt_alt_example_info(oplt_alt& p, base_learner& base, example& ec){
     for (auto &cl : ec.l.cs.costs) cout << "LABEL: " << cl.class_index << endl;
 }
 
-void oplt_alt_prediction_info(oplt_alt& p, base_learner& base, example& ec){
-    cout << std::fixed << std::setprecision(6) << "PP: " << ec.partial_prediction << " UP: " << ec.updated_prediction
-    << " L: " << ec.loss << " S: " << ec.pred.scalar << " ETA: " << p.all->eta << endl;
-}
-
-void oplt_alt_print_all_weights(oplt_alt &p, bool show_temp = false){
-     cout << endl << "WEIGHTS:\n";
-//    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
-//        cout << " " << p.all->weights.first()[i];
-//        if(!((i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift()))) cout << " | " << endl;
-//    }
-//    cout << endl;
-
-    for (uint64_t i = 0; i <= p.all->weights.mask(); ++i) {
-        size_t j = i % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
-
-        bool show = false;
-        bool temp = false;
-        bool inverted = false;
-        size_t base = 0;
-        for(auto n : p.tree){
-            if(n->temp && n->temp->base_predictor == j) temp = true;
-            if(n->base_predictor == j){
-                inverted = n->inverted;
-                base = n->base_predictor;
-                show = true;
-            }
-        }
-
-        j = (i + 1) % (int)pow(2, p.predictor_bits + p.all->weights.stride_shift());
-
-        if(show && (!temp || show_temp)) cout << "\t(" << base << ") " << (inverted ? -1 : 1) * p.all->weights.first()[i];
-        if(!j) cout << " | " << endl;
-    }
-    cout << endl;
-}
-
 void oplt_alt_tree_info(oplt_alt& p){
     cout << "TREE SIZE: " << p.tree.size() << " TREE LEAVES: " << p.tree_leaves.size() << "\nTREE:\n";
     queue<node*> n_queue;
@@ -208,7 +171,7 @@ inline node* node_copy(oplt_alt& p, node *n){
 
 template<bool stride>
 void copy_weights(oplt_alt& p, uint32_t wv1, uint32_t wv2){
-    weight_parameters &weights = p.all->weights;
+    parameters &weights = p.all->weights;
     uint64_t mask = weights.mask();
 
     if(stride){
@@ -476,8 +439,6 @@ void learn_node(oplt_alt& p, node* n, base_learner& base, example& ec){
     }
     else base.learn(ec, n->base_predictor);
     ++p.n_visited_nodes;
-
-    //if(DEBUG) oplt_alt_prediction_info(p, base, ec);
 }
 
 inline float predict_node(oplt_alt &p, node *n, base_learner& base, example& ec){
@@ -485,8 +446,6 @@ inline float predict_node(oplt_alt &p, node *n, base_learner& base, example& ec)
 
     ec.l.simple = {FLT_MAX, 0.f, 0.f};
     base.predict(ec, n->base_predictor);
-
-    if(DEBUG) oplt_alt_prediction_info(p, base, ec);
 
     if(n->inverted) ec.partial_prediction *= -1.0f;
     ++p.n_visited_nodes;
