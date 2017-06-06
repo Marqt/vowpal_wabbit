@@ -10,6 +10,7 @@
 #include <queue>
 #include <list>
 #include <chrono>
+#include <random>
 
 #include "reductions.h"
 #include "vw.h"
@@ -35,9 +36,12 @@ struct plt {
     uint32_t ti; // number of internal nodes
     uint32_t kary;
 
+    uint32_t *labels_nodes_map;
+    uint32_t *nodes_labels_map;
     float inner_threshold;  // inner threshold
     bool positive_labels;   // print positive labels
     bool top_k_labels;   // print top-k labels
+    bool remap_labels;
     bool greedy;
     float* nodes_t;
     uint32_t p_at_k;
@@ -143,7 +147,7 @@ void learn(plt& p, base_learner& base, example& ec){
             if (cl.class_index > p.k)
                 cerr << "Label " << cl.class_index << " is not in {1," << p.k << "} This won't work right." << endl;
 
-            uint32_t tn = cl.class_index + p.ti - 1;
+            uint32_t tn = p.labels_nodes_map[cl.class_index] + p.ti - 1;
             n_positive.insert(tn);
             while (tn > 0) {
                 tn = floor(static_cast<float>(tn - 1) / p.kary);
@@ -230,7 +234,7 @@ void predict(plt& p, base_learner& base, example& ec){
                         node_queue.push({n_child, cp});
                     }
                 } else {
-                    uint32_t l = node.n - p.ti + 1;
+                    uint32_t l = p.nodes_labels_map[node.n - p.ti + 1];
                     positive_labels.push_back({l, cp});
                 }
             }
@@ -276,7 +280,7 @@ void predict(plt& p, base_learner& base, example& ec){
         vector<uint32_t> true_labels;
         for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
 
-        uint32_t label = current - p.ti + 1;
+        uint32_t label = p.nodes_labels_map[current - p.ti + 1];
         if (find(true_labels.begin(), true_labels.end(), label) != true_labels.end())
             p.precision_at_k[0] += 1.0f;
     }
@@ -292,7 +296,7 @@ void predict(plt& p, base_learner& base, example& ec){
             node_queue.pop();
 
             if (find(found_leaves.begin(), found_leaves.end(), node.n) != found_leaves.end()) {
-                uint32_t l = node.n - p.ti + 1;
+                uint32_t l = p.nodes_labels_map[node.n - p.ti + 1];
                 best_labels.push_back(l);
                 if (best_labels.size() >= p.p_at_k) break;
             } else {
@@ -403,6 +407,7 @@ base_learner* plt_setup(vw& all) //learner setup
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
             ("positive_labels", "print all positive labels")
             ("top_k_labels", "print top-k labels")
+            ("remap_labels", "remap labels")
             ("greedy", "greedy prediction");
     add_options(all);
 
@@ -412,6 +417,7 @@ base_learner* plt_setup(vw& all) //learner setup
     data.positive_labels = false;
     data.top_k_labels = false;
     data.greedy = false;
+    data.remap_labels = false;
     data.all = &all;
 
     data.precision = 0;
@@ -444,7 +450,6 @@ base_learner* plt_setup(vw& all) //learner setup
     data.ti = data.t - data.k;
     *(all.file_options) << " --kary_tree " << data.kary;
 
-
     if( all.vm.count("inner_threshold"))
         data.inner_threshold = all.vm["inner_threshold"].as<float>();
 
@@ -456,6 +461,9 @@ base_learner* plt_setup(vw& all) //learner setup
 
     if( all.vm.count("top_k_labels"))
         data.top_k_labels = true;
+
+    if( all.vm.count("remap_labels"))
+        data.remap_labels = true;
 
     if( all.vm.count("greedy"))
         data.greedy = true;
@@ -481,6 +489,38 @@ base_learner* plt_setup(vw& all) //learner setup
 
     data.nodes_t = calloc_or_throw<float>(data.t);
     for(size_t i = 0; i < data.t; ++i) data.nodes_t[i] = all.initial_t;
+
+    // map labels
+    data.labels_nodes_map = calloc_or_throw<uint32_t>(data.k + 1);
+    data.nodes_labels_map = calloc_or_throw<uint32_t>(data.k + 1);
+    for(uint32_t i = 0; i <= data.k; ++i){
+        data.labels_nodes_map[i] = i;
+        data.nodes_labels_map[i] = i;
+    }
+
+    if(data.remap_labels){
+        default_random_engine rng;
+        rng.seed(all.random_seed);
+        for(uint32_t i = 0; i <= data.k; ++i) {
+            uniform_int_distribution <uint32_t> dist(i, data.k);
+            auto swap = dist(rng);
+
+            auto temp = data.labels_nodes_map[i];
+            data.labels_nodes_map[i] = data.labels_nodes_map[swap];
+            data.labels_nodes_map[swap] = temp;
+        }
+
+        for(uint32_t i = 0; i <= data.k; ++i) {
+            data.nodes_labels_map[data.labels_nodes_map[i]] = i;
+        }
+
+        *(all.file_options) << " --remap_labels ";
+        *(all.file_options) << " --random_seed " << all.random_seed;
+    }
+
+    for(uint32_t i = 0; i <= data.k; ++i){
+        cout << data.labels_nodes_map[i] << " " << data.nodes_labels_map[i] << endl;
+    }
 
     // override parser
     //------------------------------------------------------------------------------------------------------------------
