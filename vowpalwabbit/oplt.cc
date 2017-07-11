@@ -819,6 +819,7 @@ base_learner* oplt_setup(vw& all) //learner setup
             ("top_k_labels", "print top-k labels")
             ("save_tree_structure", po::value<string>(), "save tree structure to file")
             ("load_tree_structure", po::value<string>(), "load tree structure from file")
+            ("k_from_structure", "")
             ("greedy", "greedy prediction");
     add_options(all);
 
@@ -899,6 +900,24 @@ base_learner* oplt_setup(vw& all) //learner setup
         data.copy = copy_weights<true>;
 
 
+    // init tree
+    // -----------------------------------------------------------------------------------------------------------------
+
+    init_tree(data);
+
+    if(all.vm.count("save_tree_structure")) {
+        data.save_tree_structure = true;
+        data.save_tree_structure_file = all.vm["save_tree_structure"].as<string>();
+    }
+    else
+        data.save_tree_structure = false;
+    if(all.vm.count("load_tree_structure"))
+        load_tree_structure(data, all.vm["load_tree_structure"].as<string>());
+
+    if(all.vm.count("k_from_structure"))
+        data.max_predictors = data.tree.size();
+
+
     // init multiclass learner
     // -----------------------------------------------------------------------------------------------------------------
 
@@ -917,22 +936,6 @@ base_learner* oplt_setup(vw& all) //learner setup
         l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false>, all.p, data.max_predictors);
         l->set_finish(finish<false>);
     }
-
-
-    // init tree
-    // -----------------------------------------------------------------------------------------------------------------
-
-    init_tree(data);
-
-    if(all.vm.count("save_tree_structure")) {
-        data.save_tree_structure = true;
-        data.save_tree_structure_file = all.vm["save_tree_structure"].as<string>();
-    }
-    else
-        data.save_tree_structure = false;
-    if(all.vm.count("load_tree_structure"))
-        load_tree_structure(data, all.vm["load_tree_structure"].as<string>());
-
 
     // override parser
     // -----------------------------------------------------------------------------------------------------------------
