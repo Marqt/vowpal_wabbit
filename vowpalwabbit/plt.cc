@@ -45,6 +45,8 @@ struct plt {
     bool greedy;
     float* nodes_t;
     uint32_t p_at_k;
+	
+	float eps;
     float precision;
     float predicted_number;
     vector<float> precision_at_k;
@@ -205,7 +207,7 @@ inline float predict_node(plt& p, uint32_t n, base_learner& base, example& ec){
     return sigmoid(ec.partial_prediction);
 }
 
-template<bool use_threshold, bool greedy>
+template<bool use_threshold, bool greedy, bool approximate, bool approx_missing_only>
 void predict(plt& p, base_learner& base, example& ec){
 
     D_COUT << "PREDICT EXAMPLE: " << p.all->sd->example_number << endl;
@@ -285,7 +287,104 @@ void predict(plt& p, base_learner& base, example& ec){
             p.precision_at_k[0] += 1.0f;
     }
 
-    // top-k predictions
+    else if (approximate) {
+		vector<uint32_t> best_labels, found_leaves;
+		priority_queue<node> queueQ;
+		priority_queue<node> queueK;
+		priority_queue<node> queueL;
+        queueQ.push({0, 1.0f});
+        //p.predictions.erase();
+	  
+        while (!queueQ.empty()) {
+            node n = queueQ.top(); // current node
+            queueQ.pop();
+
+            if (find(found_leaves.begin(), found_leaves.end(), n.n) != found_leaves.end()) {
+                uint32_t l = n.n - p.ti + 1;
+                best_labels.push_back(l);
+				//p.predictions.push_back(float(l));
+				//p.predictions.push_back(float(n.p));
+                if (best_labels.size() >= p.p_at_k) break;
+
+            } else {
+                float cp = n.p * predict_node(p, n.n, base, ec);
+		p.n_visited_nodes += 1;
+		
+                if (n.n < p.ti) {
+		  if (cp > p.eps){
+                    for(uint32_t i = 1; i <= p.kary; ++i) {
+                        uint32_t n_child = p.kary * n.n + i;
+                        queueQ.push({n_child, cp});
+                    }
+		  }else{
+		    queueK.push({n.n, cp});
+		  }
+                } else {
+                    found_leaves.push_back(n.n);
+                    queueQ.push({n.n, cp});
+                }
+            }
+        }
+
+        while (!queueK.empty()) {
+            node n = queueK.top(); // current node
+            queueK.pop();
+			uint32_t current = n.n;
+			float current_p = predict_node(p, current, base, ec);
+
+			while(current < p.ti){
+				uint32_t best = 0;
+				float best_p = 0;
+
+				for(uint32_t i = 1; i <= p.kary; ++i) {
+					uint32_t child = p.kary * current + i;
+					float child_p = current_p * predict_node(p, child, base, ec);
+					p.n_visited_nodes += 1;
+
+					if(best_p < child_p){
+					best = child;
+					best_p = child_p;
+						}
+				}
+
+				current = best;
+				current_p = best_p;
+			}
+			if(approx_missing_only){
+				uint32_t l = current - p.ti + 1;
+				best_labels.push_back(l);
+				//p.predictions.push_back(float(l));
+				//p.predictions.push_back(float(current_p));
+				if (best_labels.size() >= p.p_at_k) break;
+			}else{
+				queueL.push({current, current_p});
+			}
+		  
+		}
+		if(!approx_missing_only){
+			while(!queueL.empty()) {
+				node n = queueL.top(); // current node
+				queueL.pop();
+				uint32_t l = n.n - p.ti + 1;
+				best_labels.push_back(l);
+				//p.predictions.push_back(float(l));
+				//p.predictions.push_back(float(n.p));
+				if (best_labels.size() >= p.p_at_k) break;
+			}
+		}
+            
+        vector<uint32_t> true_labels;
+        for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
+
+        if (p.p_at_k > 0 && true_labels.size() > 0) {
+            for (size_t i = 0; i < p.p_at_k; ++i) {
+                if (find(true_labels.begin(), true_labels.end(), best_labels[i]) != true_labels.end())
+                    p.precision_at_k[i] += 1.0f;
+            }
+        }
+        
+    }
+	// top-k predictions
     else {
         vector<uint32_t> best_labels, found_leaves;
         priority_queue<node> node_queue;
@@ -405,10 +504,16 @@ base_learner* plt_setup(vw& all) //learner setup
             ("kary_tree", po::value<uint32_t>(), "tree in which each node has no more than k children")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
-            ("positive_labels", "print all positive labels")
+	    ("eps", po::value<float>(), "eps for the approximate inference")
+	    ("positive_labels", "print all positive labels")
             ("top_k_labels", "print top-k labels")
             ("remap_labels", "remap labels")
-            ("greedy", "greedy prediction");
+            ("greedy", "greedy prediction")
+	    ("approx", "use approximate top-k prediction")
+            ("approx-missing-only", "during approximate inference search only no more than k paths greedly")
+	;
+	
+			
     add_options(all);
 
     plt& data = calloc_or_throw<plt>();
@@ -424,6 +529,7 @@ base_learner* plt_setup(vw& all) //learner setup
     data.predicted_number = 0;
     data.prediction_count = 0;
     data.p_at_k = 1;
+    data.eps = 0.0;
     data.n_visited_nodes = 0;
     data.ec_count = 0;
 
@@ -461,6 +567,8 @@ base_learner* plt_setup(vw& all) //learner setup
 
     if( all.vm.count("top_k_labels"))
         data.top_k_labels = true;
+	if( all.vm.count("eps") )
+        data.eps = all.vm["eps"].as<float>();
 
     if( all.vm.count("remap_labels"))
         data.remap_labels = true;
@@ -472,18 +580,28 @@ base_learner* plt_setup(vw& all) //learner setup
     // -----------------------------------------------------------------------------------------------------------------
 
     if (data.inner_threshold >= 0) {
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true, false>, all.p, data.t);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<true, false, false, false>, all.p, data.t);
         l->set_finish(finish<true>);
     }
     else if(data.greedy){
         data.p_at_k = 1;
         data.precision_at_k.resize(data.p_at_k);
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, true>, all.p, data.t);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, true, false, false>, all.p, data.t);
+        l->set_finish(finish<false>);
+    }
+	else if( all.vm.count("approx") ){
+
+		data.precision_at_k.resize(data.p_at_k);
+		if( all.vm.count("approx-missing-only") ){
+			l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false, true, true>, all.p, data.t);
+		}else{
+			l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false, true, false>, all.p, data.t);
+		}
         l->set_finish(finish<false>);
     }
     else{
         data.precision_at_k.resize(data.p_at_k);
-        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false>, all.p, data.t);
+        l = &init_multiclass_learner(&data, setup_base(all), learn, predict<false, false, false, false>, all.p, data.t);
         l->set_finish(finish<false>);
     }
 
