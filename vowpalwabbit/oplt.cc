@@ -62,6 +62,7 @@ struct oplt {
     float predicted_number;
     v_array<float> precision_at_k;
     size_t prediction_count;
+    uint32_t next_to_expand;
 
     // node expanding
     void(*copy)(oplt& p, uint32_t wv1, uint32_t wv2);
@@ -215,6 +216,7 @@ void init_tree(oplt& p){
     p.tree_root = init_node(p); // root node
     p.tree_root->temp = init_node(p); // first temp node
     p.tree.push_back(p.tree_root);
+    p.next_to_expand = 0;
 }
 
 
@@ -467,7 +469,7 @@ node* expand_node(oplt& p, node* n, uint32_t new_label){
     return new_label_node;
 }
 
-template<bool best_predicion, bool balanced>
+template<bool best_predicion, bool balanced, bool complete>
 node* add_new_label(oplt& p, base_learner& base, example& ec, uint32_t new_label){
     D_COUT << "NEW LABEL: " << new_label << endl;
 
@@ -497,6 +499,12 @@ node* add_new_label(oplt& p, base_learner& base, example& ec, uint32_t new_label
         while (to_expand->children.size() >= p.kary) {
             to_expand = to_expand->children[to_expand->next_to_expand++ % to_expand->children.size()];
         }
+    }
+    else if(complete){
+        to_expand = p.tree[p.next_to_expand];
+        if(to_expand->children.size() >= p.kary)
+            ++p.next_to_expand;
+        to_expand = p.tree[p.next_to_expand];
     }
     else{ // random policy
         uniform_int_distribution <uint32_t> dist(0, p.kary - 1);
@@ -813,6 +821,7 @@ base_learner* oplt_setup(vw& all) //learner setup
             ("random_policy", "expand random node")
             ("best_prediction_policy", "expand node with best prediction value")
             ("balanced_tree_policy", "keep balanced tree")
+            ("complete_tree_policy", "expand random node")
             ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
             ("p_at", po::value<uint32_t>(), "P@k (default 1)")
             ("positive_labels", "print all positive labels")
@@ -868,15 +877,19 @@ base_learner* oplt_setup(vw& all) //learner setup
 
     // expand policy options
     if(all.vm.count("best_prediction_policy")) {
-        data.add_new_label = add_new_label<true, false>;
+        data.add_new_label = add_new_label<true, false, false>;
         expand_policy = "best_prediction_policy";
     }
     if(all.vm.count("balanced_tree_policy")) {
-        data.add_new_label = add_new_label<false, true>;
+        data.add_new_label = add_new_label<false, true, false>;
         expand_policy = "balanced_tree_policy";
     }
+    if(all.vm.count("complete_tree_policy")) {
+        data.add_new_label = add_new_label<false, false, true>;
+        expand_policy = "complete_tree_policy";
+    }
     else // if(all.vm.count("random_policy"))
-        data.add_new_label = add_new_label<false, false>;
+        data.add_new_label = add_new_label<false, false, false>;
 
 
     if(all.vm.count("inner_threshold"))

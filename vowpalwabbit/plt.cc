@@ -57,6 +57,8 @@ struct plt {
     
     long n_visited_nodes;
 
+    float ec_loss;
+    float loss_sum;
     uint32_t ec_count;
     chrono::time_point<chrono::steady_clock> learn_predict_start_time_point;
 };
@@ -124,11 +126,13 @@ void save_load_nodes(plt& p, io_buf& model_file, bool read, bool text){
 void learn_node(plt& p, uint32_t n, base_learner& base, example& ec){
     D_COUT << "LEARN NODE: " << n << " LABEL: " << ec.l.simple.label << " WEIGHT: " << ec.weight << " NODE_T: " << p.nodes_t[n] << endl;
 
+    ec.loss = 0;
     p.all->sd->t = p.nodes_t[n];
     p.nodes_t[n] += ec.weight;
 
     base.learn(ec, n);
     ++p.n_visited_nodes;
+    p.ec_loss += ec.loss;
 }
 
 void learn(plt& p, base_learner& base, example& ec){
@@ -185,7 +189,9 @@ void learn(plt& p, base_learner& base, example& ec){
     ec.l.simple.label = -1.f;
     for (auto &n : n_negative) learn_node(p, n, base, ec);
 
+    p.loss_sum += p.ec_loss;
     ec.l.cs = ec_labels;
+    ec.loss = p.ec_loss;
     p.all->sd->t = t;
     p.all->sd->weighted_holdout_examples = weighted_holdout_examples;
     ec.pred.multiclass = 0;
@@ -460,7 +466,7 @@ void finish_example(vw& all, plt& p, example& ec){
 }
 
 void pass_end(plt& p){
-    cout << "end of pass " << p.all->passes_complete << "\n";
+    cout << "end of pass " << p.all->passes_complete << ", avg. loss = " << p.loss_sum / p.ec_count << "\n";
 }
 
 template<bool use_threshold>
@@ -501,17 +507,16 @@ base_learner* plt_setup(vw& all) //learner setup
     if (missing_option<size_t, true>(all, "plt", "Use probabilistic label tree for multilabel with <k> labels"))
         return nullptr;
     new_options(all, "plt options")
-            ("kary_tree", po::value<uint32_t>(), "tree in which each node has no more than k children")
-            ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
-            ("p_at", po::value<uint32_t>(), "P@k (default 1)")
+        ("kary_tree", po::value<uint32_t>(), "tree in which each node has no more than k children")
+        ("inner_threshold", po::value<float>(), "threshold for positive label (default 0.15)")
+        ("p_at", po::value<uint32_t>(), "P@k (default 1)")
 	    ("eps", po::value<float>(), "eps for the approximate inference")
 	    ("positive_labels", "print all positive labels")
-            ("top_k_labels", "print top-k labels")
-            ("remap_labels", "remap labels")
-            ("greedy", "greedy prediction")
+        ("top_k_labels", "print top-k labels")
+        ("remap_labels", "remap labels")
+        ("greedy", "greedy prediction")
 	    ("approx", "use approximate top-k prediction")
-            ("approx-missing-only", "during approximate inference search only no more than k paths greedly")
-	;
+        ("approx-missing-only", "during approximate inference search only no more than k paths greedly");
 	
 			
     add_options(all);
@@ -531,6 +536,7 @@ base_learner* plt_setup(vw& all) //learner setup
     data.p_at_k = 1;
     data.eps = 0.0;
     data.n_visited_nodes = 0;
+    data.loss_sum = 0.0;
     data.ec_count = 0;
 
     // plt parse options
@@ -636,9 +642,9 @@ base_learner* plt_setup(vw& all) //learner setup
         *(all.file_options) << " --random_seed " << all.random_seed;
     }
 
-    for(uint32_t i = 0; i <= data.k; ++i){
-        cout << data.labels_nodes_map[i] << " " << data.nodes_labels_map[i] << endl;
-    }
+    //for(uint32_t i = 0; i <= data.k; ++i){
+    //    cout << data.labels_nodes_map[i] << " " << data.nodes_labels_map[i] << endl;
+    //}
 
     // override parser
     //------------------------------------------------------------------------------------------------------------------

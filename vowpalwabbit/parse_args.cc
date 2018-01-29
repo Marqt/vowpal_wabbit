@@ -71,6 +71,7 @@ license as described in the file LICENSE.
 #include "plt.h"
 #include "oplt.h"
 #include "br.h"
+#include "hsm.h"
 #include "marginal.h"
 #include "explore_eval.h"
 
@@ -1112,6 +1113,7 @@ void parse_reductions(vw& all)
   all.reduction_stack.push_back(plt_setup);
   all.reduction_stack.push_back(oplt_setup);
   all.reduction_stack.push_back(oplt_alt_setup);
+  all.reduction_stack.push_back(hsm_setup);
 
   all.l = setup_base(all);
 }
