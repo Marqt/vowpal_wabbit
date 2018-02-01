@@ -94,11 +94,13 @@ void save_load_nodes(hsm& p, io_buf& model_file, bool read, bool text){
 void learn_node(hsm& p, uint32_t n, base_learner& base, example& ec){
     D_COUT << "LEARN NODE: " << n << " LABEL: " << ec.l.simple.label << " WEIGHT: " << ec.weight << " NODE_T: " << p.nodes_t[n] << endl;
 
+    ec.loss = 0;
     p.all->sd->t = p.nodes_t[n];
     p.nodes_t[n] += ec.weight;
 
     base.learn(ec, n);
     ++p.n_visited_nodes;
+    p.ec_loss += ec.loss;
 }
 
 void learn(hsm& p, base_learner& base, example& ec){
@@ -137,9 +139,13 @@ void learn(hsm& p, base_learner& base, example& ec){
     else
         cerr << "No label, this won't work right." << endl;
 
+    p.ec_loss = 0;
+
     p.loss_sum += p.ec_loss;
-    ec.l.cs = ec_labels;
     ec.loss = p.ec_loss;
+    p.ec_count += 1;
+
+    ec.l.cs = ec_labels;
     p.all->sd->t = t;
     p.all->sd->weighted_holdout_examples = weighted_holdout_examples;
     ec.pred.multiclass = 0;

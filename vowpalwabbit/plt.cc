@@ -183,6 +183,8 @@ void learn(plt& p, base_learner& base, example& ec){
     else
         n_negative.insert(0);
 
+    p.ec_loss = 0;
+
     ec.l.simple = {1.f, 0.f, 0.f};
     for (auto &n : n_positive) learn_node(p, n, base, ec);
 
@@ -190,11 +192,14 @@ void learn(plt& p, base_learner& base, example& ec){
     for (auto &n : n_negative) learn_node(p, n, base, ec);
 
     p.loss_sum += p.ec_loss;
-    ec.l.cs = ec_labels;
     ec.loss = p.ec_loss;
+    p.ec_count += 1;
+
+    ec.l.cs = ec_labels;
     p.all->sd->t = t;
     p.all->sd->weighted_holdout_examples = weighted_holdout_examples;
     ec.pred.multiclass = 0;
+
 
     D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
