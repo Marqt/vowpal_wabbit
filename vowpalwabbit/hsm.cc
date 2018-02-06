@@ -103,6 +103,7 @@ void learn_node(hsm& p, uint32_t n, base_learner& base, example& ec){
     p.ec_loss += ec.loss;
 }
 
+//K-ARY
 void learn(hsm& p, base_learner& base, example& ec){
 
     D_COUT << "LEARN EXAMPLE: " << p.all->sd->example_number << " PASS: " << p.all->passes_complete << endl;
@@ -114,10 +115,11 @@ void learn(hsm& p, base_learner& base, example& ec){
 
     if (ec_labels.costs.size() > 0) {
 
-        uniform_int_distribution<size_t> uniform(0, ec_labels.costs.size());
+        uniform_int_distribution<size_t> uniform(0, ec_labels.costs.size()-1);
 
         uint32_t ec_label = 0;
         uint32_t ec_l_idx = uniform(p.rng);
+
         uint32_t i = 0;
         for (auto& cl : ec_labels.costs) {
             ec_label = cl.class_index;
@@ -131,8 +133,13 @@ void learn(hsm& p, base_learner& base, example& ec){
         ec.l.simple = {1.f, 0.f, 0.f};
         while (tn > 0) {
             uint32_t new_tn = floor(static_cast<float>(tn - 1) / p.kary);
-            ec.l.simple.label = (tn % p.kary != 0 ? 1.0: -1.0);
-            learn_node(p, new_tn, base, ec);
+            for(int child_index = 1; child_index <= p.kary; child_index++){
+                int child_tn = p.kary*new_tn + child_index;
+                if(child_tn < p.t){
+                    ec.l.simple.label = (child_tn == tn ? 1.0: -1.0);
+                    learn_node(p, child_tn, base, ec);
+                }
+            }
             tn = new_tn;
         }
     }
@@ -150,9 +157,61 @@ void learn(hsm& p, base_learner& base, example& ec){
     p.all->sd->weighted_holdout_examples = weighted_holdout_examples;
     ec.pred.multiclass = 0;
 
+
     D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
 
+
+////BINARY
+//void learn(hsm& p, base_learner& base, example& ec){
+//
+//    D_COUT << "LEARN EXAMPLE: " << p.all->sd->example_number << " PASS: " << p.all->passes_complete << endl;
+//
+//    COST_SENSITIVE::label ec_labels = ec.l.cs;
+//    double t = p.all->sd->t;
+//    double weighted_holdout_examples = p.all->sd->weighted_holdout_examples;
+//    p.all->sd->weighted_holdout_examples = 0;
+//
+//    if (ec_labels.costs.size() > 0) {
+//
+//        uniform_int_distribution<size_t> uniform(0, ec_labels.costs.size()-1);
+//
+//        uint32_t ec_label = 0;
+//        uint32_t ec_l_idx = uniform(p.rng);
+//
+//        uint32_t i = 0;
+//        for (auto& cl : ec_labels.costs) {
+//            ec_label = cl.class_index;
+//            if(i++ == ec_l_idx) break;
+//        }
+//
+//        if (ec_label > p.k)
+//            cerr << "Label " << ec_label << " is not in {1," << p.k << "} This won't work right." << endl;
+//        uint32_t tn = ec_label + p.ti - 1;
+//
+//        ec.l.simple = {1.f, 0.f, 0.f};
+//        while (tn > 0) {
+//            uint32_t new_tn = floor(static_cast<float>(tn - 1) / p.kary);
+//            ec.l.simple.label = (tn % p.kary != 0 ? 1.0: -1.0);
+//            learn_node(p, new_tn, base, ec);
+//            tn = new_tn;
+//        }
+//    }
+//    else
+//        cerr << "No label, this won't work right." << endl;
+//
+//    p.loss_sum += p.ec_loss;
+//    p.ec_count++;
+//    ec.l.cs = ec_labels;
+//    ec.loss = p.ec_loss;
+//
+//    p.all->sd->t = t;
+//    p.all->sd->weighted_holdout_examples = weighted_holdout_examples;
+//    ec.pred.multiclass = 0;
+//
+//
+//    D_COUT << "----------------------------------------------------------------------------------------------------\n";
+//}
 
 // predict
 //----------------------------------------------------------------------------------------------------------------------
@@ -168,6 +227,8 @@ inline float predict_node(hsm& p, uint32_t n, base_learner& base, example& ec){
 }
 
 
+
+//K-ARY
 void predict(hsm& p, base_learner& base, example& ec){
 
     D_COUT << "PREDICT EXAMPLE: " << p.all->sd->example_number << endl;
@@ -189,23 +250,27 @@ void predict(hsm& p, base_learner& base, example& ec){
             best_labels.push_back(l);
             if (best_labels.size() >= p.p_at_k) break;
         } else {
-            float cp = node.p * predict_node(p, node.n, base, ec);
+            vector<float> node_probabs;
+            float proba_sum = 0.0;
+            for(int child_index = 1; child_index <= p.kary; child_index++){
+                int child_tn = p.kary*node.n + child_index;
 
-            uint32_t n_child = p.kary * node.n + 1;
-            node_queue.push({n_child, cp});
+                if(child_tn < p.t){
+                    float proba =  predict_node(p, child_tn, base, ec);
+                    node_probabs.push_back(proba);
+                    proba_sum += proba;
+                }
+            }
+            for(int i = 0; i<node_probabs.size(); i++){
+                node_probabs[i] /= proba_sum;
+            }
+            for(int child_index = 1; child_index <= p.kary; child_index++){
+                int child_tn = p.kary*node.n + child_index;
+                if(child_tn < p.t) {
+                    node_queue.push({child_tn, node.p*node_probabs[child_index - 1]});
+                }
+            }
 
-            n_child = p.kary * node.n + 2;
-            node_queue.push({n_child, 1.0 - cp});
-
-//            if (node.n < p.ti) {
-//                for(uint32_t i = 1; i <= p.kary; ++i) {
-//                    uint32_t n_child = p.kary * node.n + i;
-//                    node_queue.push({n_child, cp});
-//                }
-//            } else {
-//                found_leaves.push_back(node.n);
-//                node_queue.push({node.n, cp});
-//            }
         }
     }
 
@@ -223,6 +288,58 @@ void predict(hsm& p, base_learner& base, example& ec){
 
     D_COUT << "----------------------------------------------------------------------------------------------------\n";
 }
+
+
+////BINARY
+//void predict(hsm& p, base_learner& base, example& ec){
+//
+//    D_COUT << "PREDICT EXAMPLE: " << p.all->sd->example_number << endl;
+//
+//    ++p.prediction_count;
+//
+//    COST_SENSITIVE::label ec_labels = ec.l.cs;
+//
+//    vector<uint32_t> best_labels, found_leaves;
+//    priority_queue<node> node_queue;
+//    node_queue.push({0, 1.0f});
+//
+//    while (!node_queue.empty()) {
+//        node node = node_queue.top(); // current node
+//        node_queue.pop();
+//
+//        if (node.n >= p.ti) {
+//            uint32_t l = p.nodes_labels_map[node.n - p.ti + 1];
+//            best_labels.push_back(l);
+////            cout<<l<<" : "<< node.p<<"; ";
+//            if (best_labels.size() >= p.p_at_k) break;
+//        } else {
+//            float p_left =  predict_node(p, node.n, base, ec);
+//
+//            uint32_t n_child = p.kary * node.n + 1;
+//            node_queue.push({n_child, node.p*p_left});
+//
+//            n_child = p.kary * node.n + 2;
+//            node_queue.push({n_child, node.p*(1.0 - p_left)});
+//
+//        }
+//    }
+//
+////    cout<<endl;
+//    vector<uint32_t> true_labels;
+//    for (auto &cl : ec_labels.costs) true_labels.push_back(cl.class_index);
+//
+//    if (p.p_at_k > 0 && true_labels.size() > 0) {
+//        for (size_t i = 0; i < p.p_at_k; ++i) {
+//            if (find(true_labels.begin(), true_labels.end(), best_labels[i]) != true_labels.end())
+//                p.precision_at_k[i] += 1.0f;
+//        }
+//    }
+//
+//    ec.l.cs = ec_labels;
+//
+//    D_COUT << "----------------------------------------------------------------------------------------------------\n";
+//}
+
 
 
 // other
